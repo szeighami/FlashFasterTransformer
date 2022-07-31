@@ -18,6 +18,7 @@
 #pragma once
 
 #include "src/fastertransformer/layers/attention_layers/BaseAttentionLayer.h"
+#include "/workspace/flash-attention/csrc/flash_attn/src/fmha.h"
 
 namespace fastertransformer {
 
@@ -60,6 +61,10 @@ protected:
     float* qk_buf_float_ = nullptr;
     T* qkv_buf_2_ = nullptr;
     T* qkv_buf_3_ = nullptr;
+    T* flash_buf = nullptr;
+    float* flash_otemp= nullptr;
+    float* flash_softmax_lse= nullptr;
+    int* flash_seq_lens= nullptr;
 
 public:
     GptContextAttentionLayer(size_t max_batch_size,

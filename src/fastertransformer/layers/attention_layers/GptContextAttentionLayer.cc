@@ -112,89 +112,158 @@ void GptContextAttentionLayer<T>::forward(std::vector<fastertransformer::Tensor>
     sync_check_cuda_error();
 
     if (is_final == false) {
-        const cudaDataType_t gemm_data_type = getCudaDataType<T>();
-        if (is_qk_buf_float_ == true && gemm_data_type != CUDA_R_32F) {
-            cublas_wrapper_->stridedBatchedGemm(CUBLAS_OP_T,
-                                                CUBLAS_OP_N,
-                                                request_seq_len,
-                                                request_seq_len,
-                                                size_per_head_,
-                                                1.0f,
-                                                k_buf_2_,
-                                                gemm_data_type,
-                                                size_per_head_,
-                                                request_seq_len * size_per_head_,
-                                                q_buf_2_,
-                                                gemm_data_type,
-                                                size_per_head_,
-                                                request_seq_len * size_per_head_,
-                                                0.0f,
-                                                qk_buf_float_,
-                                                CUDA_R_32F,
-                                                request_seq_len,
-                                                request_seq_len * request_seq_len,
-                                                request_batch_size * local_head_num_,
-                                                CUDA_R_32F);
+        bool flash_var; std::stringstream ss(std::getenv("context_attn_flash")); ss >> flash_var;
+        bool faster_var; std::stringstream ss2(std::getenv("context_attn_faster")); ss2 >> faster_var;
+
+        bool validate_and_faster = faster_var && flash_var;
+        bool validate_and_flash = !faster_var && !flash_var;
+        bool validate = validate_and_faster || validate_and_flash;
+        
+        bool run_flash =flash_var || validate_and_flash;
+        bool run_faster = faster_var || validate_and_flash;
+        bool use_flash = !faster_var;
+
+        if (run_flash){
+            bool is_bf16 = false;
+
+            mha_faster_fwd(qkv_buf_, 
+                flash_buf,
+                flash_otemp,
+                flash_softmax_lse,
+                flash_seq_lens,
+                request_batch_size,
+                request_seq_len,
+                size_per_head_,
+                local_head_num_,
+                is_bf16,
+                stream_
+                );
+
             sync_check_cuda_error();
-            T scalar = 1 / sqrtf(size_per_head_ * 1.0f);
-            invokeMaskedSoftMax(qk_buf_,
-                                qk_buf_float_,
-                                attention_mask,
-                                request_batch_size,
-                                request_seq_len,
-                                local_head_num_,
-                                scalar,
-                                stream_);
-            sync_check_cuda_error();
+
         }
-        else {
-            cublas_wrapper_->stridedBatchedGemm(CUBLAS_OP_T,
+
+        if (run_faster){
+            const cudaDataType_t gemm_data_type = getCudaDataType<T>();
+            if (is_qk_buf_float_ == true && gemm_data_type != CUDA_R_32F) {
+                cublas_wrapper_->stridedBatchedGemm(CUBLAS_OP_T,
+                                                    CUBLAS_OP_N,
+                                                    request_seq_len,
+                                                    request_seq_len,
+                                                    size_per_head_,
+                                                    1.0f,
+                                                    k_buf_2_,
+                                                    gemm_data_type,
+                                                    size_per_head_,
+                                                    request_seq_len * size_per_head_,
+                                                    q_buf_2_,
+                                                    gemm_data_type,
+                                                    size_per_head_,
+                                                    request_seq_len * size_per_head_,
+                                                    0.0f,
+                                                    qk_buf_float_,
+                                                    CUDA_R_32F,
+                                                    request_seq_len,
+                                                    request_seq_len * request_seq_len,
+                                                    request_batch_size * local_head_num_,
+                                                    CUDA_R_32F);
+                sync_check_cuda_error();
+                T scalar = 1 / sqrtf(size_per_head_ * 1.0f);
+                invokeMaskedSoftMax(qk_buf_,
+                                    qk_buf_float_,
+                                    attention_mask,
+                                    request_batch_size,
+                                    request_seq_len,
+                                    local_head_num_,
+                                    scalar,
+                                    stream_);
+                sync_check_cuda_error();
+            }
+            else {
+                cublas_wrapper_->stridedBatchedGemm(CUBLAS_OP_T,
+                                                    CUBLAS_OP_N,
+                                                    request_seq_len,
+                                                    request_seq_len,
+                                                    size_per_head_,
+                                                    k_buf_2_,
+                                                    size_per_head_,
+                                                    request_seq_len * size_per_head_,
+                                                    q_buf_2_,
+                                                    size_per_head_,
+                                                    request_seq_len * size_per_head_,
+                                                    qk_buf_,
+                                                    request_seq_len,
+                                                    request_seq_len * request_seq_len,
+                                                    request_batch_size * local_head_num_);
+
+                T scalar = 1 / sqrtf(size_per_head_ * 1.0f);
+                invokeMaskedSoftMax(qk_buf_,
+                                    qk_buf_,
+                                    attention_mask,
+                                    request_batch_size,
+                                    request_seq_len,
+                                    local_head_num_,
+                                    scalar,
+                                    stream_);
+                sync_check_cuda_error();
+            }
+
+            cublas_wrapper_->stridedBatchedGemm(CUBLAS_OP_N,
                                                 CUBLAS_OP_N,
+                                                size_per_head_,
                                                 request_seq_len,
                                                 request_seq_len,
-                                                size_per_head_,
-                                                k_buf_2_,
-                                                size_per_head_,
-                                                request_seq_len * size_per_head_,
-                                                q_buf_2_,
+                                                v_buf_2_,
                                                 size_per_head_,
                                                 request_seq_len * size_per_head_,
                                                 qk_buf_,
                                                 request_seq_len,
                                                 request_seq_len * request_seq_len,
+                                                qkv_buf_2_,
+                                                size_per_head_,
+                                                request_seq_len * size_per_head_,
                                                 request_batch_size * local_head_num_);
 
-            T scalar = 1 / sqrtf(size_per_head_ * 1.0f);
-            invokeMaskedSoftMax(qk_buf_,
-                                qk_buf_,
-                                attention_mask,
-                                request_batch_size,
-                                request_seq_len,
-                                local_head_num_,
-                                scalar,
-                                stream_);
+
+            invokeTransposeQKV(
+                qkv_buf_3_, qkv_buf_2_, request_batch_size, request_seq_len, local_head_num_, size_per_head_, stream_);
             sync_check_cuda_error();
         }
 
-        cublas_wrapper_->stridedBatchedGemm(CUBLAS_OP_N,
-                                            CUBLAS_OP_N,
-                                            size_per_head_,
-                                            request_seq_len,
-                                            request_seq_len,
-                                            v_buf_2_,
-                                            size_per_head_,
-                                            request_seq_len * size_per_head_,
-                                            qk_buf_,
-                                            request_seq_len,
-                                            request_seq_len * request_seq_len,
-                                            qkv_buf_2_,
-                                            size_per_head_,
-                                            request_seq_len * size_per_head_,
-                                            request_batch_size * local_head_num_);
+        if (validate){
+            T* flash_attn_out = (T*)malloc(sizeof(T) * request_batch_size * request_seq_len * local_hidden_units_);
+            cudaMemcpy(flash_attn_out, flash_buf, sizeof(T) * request_batch_size * request_seq_len * local_hidden_units_, cudaMemcpyDeviceToHost);  
 
-        invokeTransposeQKV(
-            qkv_buf_3_, qkv_buf_2_, request_batch_size, request_seq_len, local_head_num_, size_per_head_, stream_);
-        sync_check_cuda_error();
+            T* faster_attn_out = (T*)malloc(sizeof(T) * request_batch_size * request_seq_len * local_hidden_units_);
+            cudaMemcpy(faster_attn_out, qkv_buf_3_, sizeof(T) * request_batch_size * request_seq_len * local_hidden_units_, cudaMemcpyDeviceToHost);  
+
+            /*
+            T* mask = (T*)malloc(sizeof(T) * request_batch_size * request_seq_len * request_seq_len);
+            cudaMemcpy(mask, attention_mask, sizeof(T) * request_batch_size * request_seq_len * request_seq_len, cudaMemcpyDeviceToHost);  
+
+            printf("ATTN MASK=======================================================================\n");
+            printf("request_batch_size=%d, request_seq_len=%d \n",request_batch_size, request_seq_len);
+            for (int i = 0; i < request_batch_size * request_seq_len * request_seq_len; i++)
+            {
+                printf("mask=%f\n", (float)mask[i]);
+            }
+            free(mask);
+            */
+
+            printf("ATTN DIFF=======================================================================\n");
+            printf("request_batch_size=%d, request_seq_len=%d , local_hidden_units_=%d\n",request_batch_size, request_seq_len , local_hidden_units_);
+            for (int i = 0; i < request_batch_size * request_seq_len * local_hidden_units_; i++)
+            {
+                printf("faster=%f, flash=%f, diff=%f\n", (float)faster_attn_out[i], (float)flash_attn_out[i], std::abs((float)(faster_attn_out[i]-flash_attn_out[i])));
+            }
+            free(faster_attn_out);
+            free(flash_attn_out);
+        }
+
+        T* kernel_out = qkv_buf_3_;
+        if (use_flash){
+            kernel_out = flash_buf;
+        }
 
 #ifdef SPARSITY_ENABLED
         if (sparse_ && cublas_wrapper_->isUseSparse(1, hidden_units_, m_padded, local_hidden_units_)) {
@@ -204,7 +273,7 @@ void GptContextAttentionLayer<T>::forward(std::vector<fastertransformer::Tensor>
                                     m_padded,
                                     local_hidden_units_,
                                     attention_weights->attention_output_weight.sp_kernel,
-                                    qkv_buf_3_,
+                                    kernel_out,
                                     attention_out);
         }
         else {
@@ -216,7 +285,7 @@ void GptContextAttentionLayer<T>::forward(std::vector<fastertransformer::Tensor>
                                   local_hidden_units_,
                                   attention_weights->attention_output_weight.kernel,
                                   hidden_units_,
-                                  qkv_buf_3_,
+                                  kernel_out,
                                   local_hidden_units_,
                                   attention_out,
                                   hidden_units_);
@@ -347,6 +416,17 @@ void GptContextAttentionLayer<T>::allocateBuffer()
         qkv_buf_2_ = (T*)allocator_->malloc(sizeof(T) * max_batch_size_ * max_seq_len_ * local_hidden_units_, true);
         qkv_buf_3_ = (T*)allocator_->malloc(sizeof(T) * max_batch_size_ * max_seq_len_ * local_hidden_units_, true);
 
+        flash_buf = (T*)allocator_->malloc(sizeof(T) * max_batch_size_ * max_seq_len_ * local_hidden_units_, true);
+        flash_otemp = (float*)allocator_->malloc(sizeof(float) * max_batch_size_ * max_seq_len_ * local_hidden_units_, true);
+        flash_softmax_lse = (float*)allocator_->malloc(sizeof(float) * max_batch_size_ * ((max_seq_len_ + 16 - 1) / 16) * 16 * local_head_num_, true);
+        flash_seq_lens = (int*)allocator_->malloc(sizeof(int) * (max_batch_size_+1), true);
+
+        int* seq_lens = (int*)malloc((max_batch_size_+1)*sizeof(int));
+        for (int i = 0; i <= max_batch_size_; i++) 
+            seq_lens[i] = (i)*max_seq_len_;
+        cudaMemcpy(flash_seq_lens, seq_lens, (max_batch_size_+1)*sizeof(int), cudaMemcpyHostToDevice); 
+        free(seq_lens);
+
         if (is_qk_buf_float_ == true) {
             qk_buf_float_ = (float*)allocator_->malloc(
                 sizeof(float) * max_batch_size_ * local_head_num_ * max_seq_len_ * max_seq_len_, true);
@@ -369,6 +449,17 @@ void GptContextAttentionLayer<T>::allocateBuffer(size_t batch_size, size_t seq_l
     qkv_buf_2_ = (T*)allocator_->reMalloc(qkv_buf_2_, sizeof(T) * batch_size * seq_len * local_hidden_units_, true);
     qkv_buf_3_ = (T*)allocator_->reMalloc(qkv_buf_3_, sizeof(T) * batch_size * seq_len * local_hidden_units_, true);
 
+    flash_buf = (T*)allocator_->reMalloc(flash_buf, sizeof(T) * batch_size * seq_len * local_hidden_units_, true);
+    flash_otemp = (float*)allocator_->reMalloc(flash_otemp, sizeof(float) * batch_size * seq_len * local_hidden_units_, true);
+    flash_softmax_lse = (float*)allocator_->reMalloc(flash_softmax_lse, sizeof(float) * batch_size * ((seq_len + 16 - 1) / 16) * 16 * local_head_num_, true);
+    flash_seq_lens = (int*)allocator_->reMalloc(flash_seq_lens, sizeof(int) * (batch_size+1), true);
+
+    int* seq_lens = (int*)malloc((batch_size+1)*sizeof(int));
+    for (int i = 0; i <= batch_size; i++) 
+        seq_lens[i] = (i)*seq_len;
+    cudaMemcpy(flash_seq_lens, seq_lens, (batch_size+1)*sizeof(int), cudaMemcpyHostToDevice); 
+    free(seq_lens);
+
     if (is_qk_buf_float_ == true) {
         qk_buf_float_ = (float*)allocator_->reMalloc(
             qk_buf_float_, sizeof(float) * batch_size * local_head_num_ * seq_len * seq_len, true);
@@ -388,6 +479,10 @@ void GptContextAttentionLayer<T>::freeBuffer()
         allocator_->free(qk_buf_);
         allocator_->free(qkv_buf_2_);
         allocator_->free(qkv_buf_3_);
+        allocator_->free(flash_buf);
+        allocator_->free(flash_otemp);
+        allocator_->free(flash_softmax_lse);
+        allocator_->free(flash_seq_lens);
 
         if (is_qk_buf_float_ == true) {
             allocator_->free(qk_buf_float_);

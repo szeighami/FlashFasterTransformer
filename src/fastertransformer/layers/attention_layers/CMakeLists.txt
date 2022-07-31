@@ -42,7 +42,8 @@ target_link_libraries(DecoderSelfAttentionLayer PUBLIC -lcublas -lcudart cublasM
 add_library(GptContextAttentionLayer STATIC GptContextAttentionLayer.cc)
 set_property(TARGET GptContextAttentionLayer PROPERTY POSITION_INDEPENDENT_CODE  ON)
 set_property(TARGET GptContextAttentionLayer PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS  ON)
-target_link_libraries(GptContextAttentionLayer PUBLIC -lcublas -lcudart cublasMMWrapper memory_utils unfused_attention_kernels)
+target_link_libraries(GptContextAttentionLayer PUBLIC -L/workspace/flash-attention/build/lib.linux-x86_64-3.8 -lflash -lcublas -lcudart cublasMMWrapper memory_utils unfused_attention_kernels)
+target_include_directories(GptContextAttentionLayer PUBLIC /workspace/flash-attention/csrc/flash_attn/src)
 
 add_library(TensorParallelDecoderSelfAttentionLayer STATIC TensorParallelDecoderSelfAttentionLayer.cc)
 set_property(TARGET TensorParallelDecoderSelfAttentionLayer PROPERTY POSITION_INDEPENDENT_CODE  ON)
