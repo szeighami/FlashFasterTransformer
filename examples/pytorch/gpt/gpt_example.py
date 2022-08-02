@@ -120,6 +120,9 @@ def main():
         print("{}: {}".format(arg, getattr(args, arg)))
     print("=========================================\n")
 
+    os.environ["context_attn_flash"] = "0"    
+    os.environ["context_attn_faster"] = "1"    
+
     enc = encoder.get_encoder(args.vocab_file, args.merges_file)
 
     # Inputs
@@ -135,7 +138,7 @@ def main():
         contexts = ['<|endoftext|>'] * batch_size
         start_ids = [torch.IntTensor([end_id])] * batch_size
 
-    print("[INFO] batch size: {}".format(batch_size))
+    print("[INFO] batch size: {}".format(batch_size),)
 
     start_lengths = [len(ids) for ids in start_ids]
     input_len = max(start_lengths)

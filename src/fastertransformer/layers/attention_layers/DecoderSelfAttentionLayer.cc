@@ -107,7 +107,9 @@ void fusedQKV_masked_attention_dispatch(const T* qkv_buf,
     }
     params.relative_attention_bias_stride = relative_attention_bias_stride;
 
-    masked_multihead_attention(params, stream);
+    bool with_decoder_attn; std::stringstream ss(std::getenv("with_decoder_attn")); ss >> with_decoder_attn;
+    if (with_decoder_attn)
+        masked_multihead_attention(params, stream);
 }
 
 template void fusedQKV_masked_attention_dispatch(const float* qkv_buf,

@@ -15,6 +15,9 @@
 add_executable(test_gemm test_gemm.cu)
 target_link_libraries(test_gemm PUBLIC -lcublas -lcudart -lcurand gemm cublasMMWrapper)
 
+add_executable(find_setting find_settings.cu)
+target_link_libraries(find_setting PUBLIC -lcublas -lcudart -lcurand gemm cublasMMWrapper)
+
 add_executable(test_sampling test_sampling.cu)
 target_link_libraries(test_sampling PUBLIC
                       -lcublas -lcublasLt -lcudart

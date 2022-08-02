@@ -24,11 +24,38 @@ import os
 import timeit
 import torch
 import numpy as np
+import pandas as pd
 dir_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(dir_path + "/../../..")
 from examples.pytorch.gpt.utils.gpt import GPT, GPTWeights
 import examples.pytorch.gpt.utils.gpt_token_encoder as encoder
 import torch.utils.benchmark as benchmark
+
+def set_default():
+    os.environ["context_attn_flash"] = "1"    
+    os.environ["context_attn_faster"] = "0"    
+    os.environ["process_new_launch"] = "0"    
+    os.environ["with_decoder_attn"] = "1"    
+    os.environ["with_decoder_ffn"] = "1"    
+    os.environ["with_context_ffn"] = "1"    
+    os.environ["with_context_attn"] = "1"    
+
+def set_setting(with_flash, with_new_kernel, setting):
+    set_default()
+    if with_flash:
+        os.environ["context_attn_flash"] = "1"    
+        os.environ["context_attn_faster"] = "0"    
+    else:
+        os.environ["context_attn_flash"] = "0"    
+        os.environ["context_attn_faster"] = "1"    
+
+    if with_new_kernel:
+        os.environ["process_new_launch"] = "1"    
+    else:
+        os.environ["process_new_launch"] = "0"    
+
+    for value in setting:
+        os.environ[value] = "0"    
 
 
 def run_model(args):
@@ -186,79 +213,126 @@ def main():
     pipeline_para_size = args.pipeline_para_size
     start_id = args.start_id
     end_id = args.end_id
-    max_batch_size = args.max_batch_size
     repetition_penalty = args.repetition_penalty
     return_cum_log_probs = args.return_cum_log_probs
     return_output_length = return_cum_log_probs > 0
 
-    os.environ["context_attn_flash"] = "0"    
-    os.environ["context_attn_faster"] = "1"    
 
-    max_seq_len = args.max_seq_len
-    layer_num = args.layer_num
-    output_len = args.output_len
-    head_num = args.head_num
-    size_per_head = args.size_per_head
-    prompt_len = 1000
+    layer_num = 16
+    head_num = 32
+    d_model = 4096
+    max_seq_len = 2048
+    size_per_head = d_model//head_num
+
+    output_lens = [1024]
+    #prompt_lens = [2, 16, 128, 1024]
+    prompt_lens = [1024]
+    batch_sizes = [1]#, 2, 4]
+    with_flashs = [False]
+    with_new_kernels = [True, False]
 
     random_seed = 0
     reps = 5
+    precisions = [16, 32]
 
-    gpt = GPT(head_num, size_per_head, vocab_size, start_id, end_id, layer_num,
-              max_seq_len, tensor_para_size, pipeline_para_size, lib_path=args.lib_path)
-    gpt.load(ckpt_path="NO_CHECKPOINT")
-    gpt.half()
     #gpt.bfloat16()
 
-    start_ids = torch.IntTensor([[10] for _ in range(prompt_len)])
-    #start_ids = pad_sequence(start_ids, batch_first=True, padding_value=end_id)
-    start_lengths = torch.IntTensor([len(ids) for ids in start_ids])
+    res = {'with_new_kernel':[], 'with_flash':[], 'batch_size':[], 'prompt_len':[], 'output_len':[], 'precision':[], 'time':[]}
+    save_res = False
+    save_file = "res_with_opts_d128.csv"
 
-    with torch.no_grad():
-        # Generate tokens.
-        tokens_batch = gpt(start_ids,
-                           start_lengths,
-                           output_len,
-                           beam_width,
-                           top_k,
-                           top_p,
-                           beam_search_diversity_rate,
-                           temperature,
-                           len_penalty,
-                           repetition_penalty,
-                           random_seed,
-                           return_output_length,
-                           return_cum_log_probs)
-        t = benchmark.Timer(
-            stmt='''fn(start_ids,
-                      start_lengths,
-                      output_len,
-                      beam_width,
-                      top_k,
-                      top_p,
-                      beam_search_diversity_rate,
-                      temperature,
-                      len_penalty,
-                      repetition_penalty,
-                      random_seed,
-                      return_output_length,
-                      return_cum_log_probs)''',
-                  globals={'fn':gpt, 
-                      'start_ids':start_ids,
-                     'start_lengths':start_lengths,
-                     'output_len':output_len,
-                     'beam_width':beam_width,
-                     'top_k':top_k,
-                     'top_p':top_p,
-                     'beam_search_diversity_rate':beam_search_diversity_rate,
-                     'temperature':temperature,
-                     'len_penalty':len_penalty,
-                     'repetition_penalty':repetition_penalty,
-                     'random_seed':random_seed,
-                     'return_output_length':return_output_length,
-                     'return_cum_log_probs':return_cum_log_probs})
+    os.environ["with_decoder_attn"] = "1"    
+    os.environ["with_decoder_ffn"] = "1"    
+    os.environ["with_context_ffn"] = "1"    
+    os.environ["with_context_attn"] = "1"    
 
-        print("took", t.timeit(reps).mean)
+    settings = [[], ["with_decoder_attn"], ["with_decoder_ffn"], ["with_context_ffn"], ["with_context_attn"]]
+
+    for precision in precisions:
+        gpt = GPT(head_num, size_per_head, vocab_size, start_id, end_id, layer_num,
+                  max_seq_len, tensor_para_size, pipeline_para_size, lib_path=args.lib_path)
+        gpt.load(ckpt_path="NO_CHECKPOINT")
+        if precision==16:
+            gpt.half()
+
+        for with_flash in with_flashs:
+            for with_new_kernel in with_new_kernels:
+                for batch_size in batch_sizes:
+                    for prompt_len in prompt_lens:
+                        for output_len in output_lens:
+                            start_ids = [torch.IntTensor([10 for _ in range(prompt_len)]) for _ in range(batch_size)]
+                            start_lengths = [len(ids) for ids in start_ids]
+                            start_ids = pad_sequence(start_ids, batch_first=True, padding_value=end_id)
+                            start_lengths = torch.IntTensor(start_lengths)
+
+                            for setting in settings:
+                                set_setting(with_flash, with_new_kernel, setting) 
+                                if setting == []:
+                                    setting_name = "all"
+                                else:
+                                    setting_name = "_".join(setting)
+
+                                with torch.no_grad():
+                                    # Generate tokens.
+                                    tokens_batch = gpt(start_ids,
+                                                       start_lengths,
+                                                       output_len,
+                                                       beam_width,
+                                                       top_k,
+                                                       top_p,
+                                                       beam_search_diversity_rate,
+                                                       temperature,
+                                                       len_penalty,
+                                                       repetition_penalty,
+                                                       random_seed,
+                                                       return_output_length,
+                                                       return_cum_log_probs)
+                                    t = benchmark.Timer(
+                                        stmt='''fn(start_ids,
+                                                  start_lengths,
+                                                  output_len,
+                                                  beam_width,
+                                                  top_k,
+                                                  top_p,
+                                                  beam_search_diversity_rate,
+                                                  temperature,
+                                                  len_penalty,
+                                                  repetition_penalty,
+                                                  random_seed,
+                                                  return_output_length,
+                                                  return_cum_log_probs)''',
+                                              globals={'fn':gpt, 
+                                                  'start_ids':start_ids,
+                                                 'start_lengths':start_lengths,
+                                                 'output_len':output_len,
+                                                 'beam_width':beam_width,
+                                                 'top_k':top_k,
+                                                 'top_p':top_p,
+                                                 'beam_search_diversity_rate':beam_search_diversity_rate,
+                                                 'temperature':temperature,
+                                                 'len_penalty':len_penalty,
+                                                 'repetition_penalty':repetition_penalty,
+                                                 'random_seed':random_seed,
+                                                 'return_output_length':return_output_length,
+                                                 'return_cum_log_probs':return_cum_log_probs})
+
+                                
+                                    time = t.timeit(reps).mean
+
+                                    res['with_flash'].append(with_flash)
+                                    res['batch_size'].append(batch_size)
+                                    res['prompt_len'].append(prompt_len)
+                                    res['output_len'].append(output_len)
+                                    res['time'].append(time)
+                                    res['precision'].append(precision)
+                                    res['setting'].append(setting_name)
+                                    res['with_new_kernel'].append(with_new_kernel)
+
+                                    if save_res:
+                                        res_df = pd.DataFrame(res)
+                                        res_df.iloc[-1:].to_csv(save_file, mode='a', header=not os.path.exists(save_file))
+                                    
+                                    print(f"with_new_kernel:{with_new_kernel}, with_flash:{with_flash}, batch_size:{batch_size},prompt_len:{prompt_len},output_len:{output_len},precision:{precision},time:{time}")
 
 if __name__ == '__main__':
     main()
