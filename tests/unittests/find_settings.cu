@@ -2102,10 +2102,13 @@ int main(int argc, char* argv[]) {
     std::vector<int> batch_sizes = {1, 2, 4, 8};
     std::vector<int> max_tokenss = {2, 16, 128, 1024};
     std::vector<int> max_input_lens = {2, 16, 128, 1024};
+    //std::vector<int> batch_sizes = {1, 2};
+    //std::vector<int> max_tokenss = {2};
+    //std::vector<int> max_input_lens = {2};
 
 
     bool save_res = true;
-    std::string path = "res.csv";
+    std::string path = "res2.csv";
 
     std::ofstream res_file;
    if (save_res){

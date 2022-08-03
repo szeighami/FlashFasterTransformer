@@ -1861,22 +1861,33 @@ template<typename T, int Dh, int Dh_MAX, typename KERNEL_PARAMS_TYPE>
 void mmha_launch_kernel(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream)
 {
     constexpr bool DO_CROSS_ATTENTION = std::is_same<KERNEL_PARAMS_TYPE, Cross_multihead_attention_params<T>>::value;
-    bool new_launch; std::stringstream ss(std::getenv("process_new_launch")); ss >> new_launch;
-    if (!new_launch){
-        constexpr int THREADS_PER_VALUE = Dh_MAX * sizeof(T) / 16;
-        int tlength = (DO_CROSS_ATTENTION) ? params.seq_length : params.timestep;
-    // printf("tlength, CROSS_ATTENTION = %d, %d\n", tlength, DO_CROSS_ATTENTION);
-        if (tlength < 32) {
-            MMHA_LAUNCH_KERNEL(T, Dh, Dh_MAX, 4, THREADS_PER_VALUE, 64, DO_CROSS_ATTENTION, stream);
-        }
-        else if (tlength < 2048) {
-            MMHA_LAUNCH_KERNEL(T, Dh, Dh_MAX, 2, THREADS_PER_VALUE, 128, DO_CROSS_ATTENTION, stream);
-        }
-        else {
-            MMHA_LAUNCH_KERNEL(T, Dh, Dh_MAX, 1, THREADS_PER_VALUE, 256, DO_CROSS_ATTENTION, stream);
-        }
+    constexpr int THREADS_PER_VALUE = Dh_MAX * sizeof(T) / 16;
+    int tlength = (DO_CROSS_ATTENTION) ? params.seq_length : params.timestep;
+// printf("tlength, CROSS_ATTENTION = %d, %d\n", tlength, DO_CROSS_ATTENTION);
+    if (tlength < 32) {
+        MMHA_LAUNCH_KERNEL(T, Dh, Dh_MAX, 4, THREADS_PER_VALUE, 64, DO_CROSS_ATTENTION, stream);
     }
-    else{
+    else if (tlength < 2048) {
+        MMHA_LAUNCH_KERNEL(T, Dh, Dh_MAX, 2, THREADS_PER_VALUE, 128, DO_CROSS_ATTENTION, stream);
+    }
+    else {
+        MMHA_LAUNCH_KERNEL(T, Dh, Dh_MAX, 1, THREADS_PER_VALUE, 256, DO_CROSS_ATTENTION, stream);
+    }
+}
+
+template<typename T, int Dh, int Dh_MAX, int TPK, int TPB, typename KERNEL_PARAMS_TYPE, int T_size>
+struct mmha_lahnch_TPV{
+    static void call(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream, int v_vec_size)
+    {
+        throw std::exception(); 
+    }
+};
+
+template<typename T, int Dh, int Dh_MAX, int TPK, int TPB, typename KERNEL_PARAMS_TYPE>
+struct mmha_lahnch_TPV<T, Dh, Dh_MAX, TPK, TPB, KERNEL_PARAMS_TYPE, 4>{
+    static void call(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream, int v_vec_size)
+    {
+        /*
         const int max_threads = 40960;
         constexpr int THREADS_PER_VALUE = 2*Dh_MAX * sizeof(T) / 16;
         if (max_threads/params.num_heads*params.batch_size < 128) {
@@ -1888,6 +1899,100 @@ void mmha_launch_kernel(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& st
         else {
             MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, 2, THREADS_PER_VALUE, 256, DO_CROSS_ATTENTION, stream);
         }
+        */
+        constexpr bool DO_CROSS_ATTENTION = std::is_same<KERNEL_PARAMS_TYPE, Cross_multihead_attention_params<T>>::value;
+
+        switch (v_vec_size){
+            case 1:
+                {
+                    constexpr int THREADS_PER_VALUE = std::min(TPB, Dh_MAX);
+                    MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
+                    break;
+                }
+            case 2:
+                {
+                    constexpr int THREADS_PER_VALUE = Dh_MAX / 2;
+                    MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
+                    break;
+                }
+            case 4:
+                {
+                    constexpr int THREADS_PER_VALUE = Dh_MAX / 4;
+                    MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
+                    break;
+                }
+            default:
+                assert(false);
+        } 
+    }
+};
+
+//template<typename T, int Dh, int Dh_MAX, int TPK, int TPB, typename KERNEL_PARAMS_TYPE, int>
+//void mmha_lahnch_TPV<T, Dh, Dh_MAX, TPK, TPB, KERNEL_PARAMS_TYPE, 2>(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream, int v_vec_size)
+template<typename T, int Dh, int Dh_MAX, int TPK, int TPB, typename KERNEL_PARAMS_TYPE>
+struct mmha_lahnch_TPV<T, Dh, Dh_MAX, TPK, TPB, KERNEL_PARAMS_TYPE, 2>{
+    static void call(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream, int v_vec_size) 
+    {
+        constexpr bool DO_CROSS_ATTENTION = std::is_same<KERNEL_PARAMS_TYPE, Cross_multihead_attention_params<T>>::value;
+
+        switch (v_vec_size){
+            case 2:
+                {
+                    constexpr int THREADS_PER_VALUE = std::min(TPB, Dh_MAX / 2);
+                    MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
+                    break;
+                }
+            case 4:
+                {
+                    constexpr int THREADS_PER_VALUE = Dh_MAX / 4;
+                    MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
+                    break;
+                }
+            case 8:
+                {
+                    constexpr int THREADS_PER_VALUE = Dh_MAX / 8;
+                    MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
+                    break;
+                }
+            default:
+                assert(false);
+        } 
+    }
+};
+
+template<typename T, int Dh, int Dh_MAX, int TPB, typename KERNEL_PARAMS_TYPE>
+void mmha_launch_TPK(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream, int v_vec_size, int k_vec_size)
+{
+    switch (k_vec_size){
+        case 1:
+            mmha_lahnch_TPV<T, Dh, Dh_MAX, 1, TPB, KERNEL_PARAMS_TYPE, sizeof(T)>::call(params, stream, v_vec_size);
+            break;
+        case 2:
+            mmha_lahnch_TPV<T, Dh, Dh_MAX, 2, TPB, KERNEL_PARAMS_TYPE, sizeof(T)>::call(params, stream, v_vec_size);
+            break;
+        case 4:
+            mmha_lahnch_TPV<T, Dh, Dh_MAX, 4, TPB, KERNEL_PARAMS_TYPE, sizeof(T)>::call(params, stream, v_vec_size);
+            break;
+        default:
+            assert(false);
+    }
+}
+
+template<typename T, int Dh, int Dh_MAX, typename KERNEL_PARAMS_TYPE>
+void mmha_launch(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream, int v_vec_size, int k_vec_size, int threads_per_block)
+{
+    switch (threads_per_block){
+        case 64:
+            mmha_launch_TPK<T, Dh, Dh_MAX, 64, KERNEL_PARAMS_TYPE>(params, stream, v_vec_size, k_vec_size);
+            break;
+        case 128:
+            mmha_launch_TPK<T, Dh, Dh_MAX, 128, KERNEL_PARAMS_TYPE>(params, stream, v_vec_size, k_vec_size);
+            break;
+        case 256:
+            mmha_launch_TPK<T, Dh, Dh_MAX, 256, KERNEL_PARAMS_TYPE>(params, stream, v_vec_size, k_vec_size);
+            break;
+        default:
+            assert(false);
     }
 }
 
@@ -1896,33 +2001,52 @@ void mmha_launch_kernel(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& st
 template<typename T, typename KERNEL_PARAMS_TYPE>
 void multihead_attention_(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream)
 {
-    switch (params.hidden_size_per_head) {
-        case 32:
-            mmha_launch_kernel<T, 32, 32, KERNEL_PARAMS_TYPE>(params, stream);
-            break;
-        case 64:
-            mmha_launch_kernel<T, 64, 64, KERNEL_PARAMS_TYPE>(params, stream);
-            break;
-        case 96:
-            mmha_launch_kernel<T, 96, 128, KERNEL_PARAMS_TYPE>(params, stream);
-            break;
-        case 128:
-            mmha_launch_kernel<T, 128, 128, KERNEL_PARAMS_TYPE>(params, stream);
-            break;
-        case 160:
-            mmha_launch_kernel<T, 160, 256, KERNEL_PARAMS_TYPE>(params, stream);
-            break;
-        case 192:
-            mmha_launch_kernel<T, 192, 256, KERNEL_PARAMS_TYPE>(params, stream);
-            break;
-        case 224:
-            mmha_launch_kernel<T, 224, 256, KERNEL_PARAMS_TYPE>(params, stream);
-            break;
-        case 256:
-            mmha_launch_kernel<T, 256, 256, KERNEL_PARAMS_TYPE>(params, stream);
-            break;
-        default:
-            assert(false);
+    bool new_launch; std::stringstream ss(std::getenv("process_new_launch")); ss >> new_launch;
+    if (!new_launch){
+        switch (params.hidden_size_per_head) {
+            case 32:
+                mmha_launch_kernel<T, 32, 32, KERNEL_PARAMS_TYPE>(params, stream);
+                break;
+            case 64:
+                mmha_launch_kernel<T, 64, 64, KERNEL_PARAMS_TYPE>(params, stream);
+                break;
+            case 96:
+                mmha_launch_kernel<T, 96, 128, KERNEL_PARAMS_TYPE>(params, stream);
+                break;
+            case 128:
+                mmha_launch_kernel<T, 128, 128, KERNEL_PARAMS_TYPE>(params, stream);
+                break;
+            case 160:
+                mmha_launch_kernel<T, 160, 256, KERNEL_PARAMS_TYPE>(params, stream);
+                break;
+            case 192:
+                mmha_launch_kernel<T, 192, 256, KERNEL_PARAMS_TYPE>(params, stream);
+                break;
+            case 224:
+                mmha_launch_kernel<T, 224, 256, KERNEL_PARAMS_TYPE>(params, stream);
+                break;
+            case 256:
+                mmha_launch_kernel<T, 256, 256, KERNEL_PARAMS_TYPE>(params, stream);
+                break;
+            default:
+                assert(false);
+        }
+    }
+    else{
+        int v_vec_size; std::stringstream ss(std::getenv("v_vec_size")); ss >> v_vec_size;
+        int k_vec_size; std::stringstream ss1(std::getenv("k_vec_size")); ss1 >> k_vec_size;
+        int threads_per_block; std::stringstream ss2(std::getenv("threads_per_block")); ss2 >> threads_per_block;
+
+        switch (params.hidden_size_per_head) {
+            case 64:
+                mmha_launch<T, 64, 64, KERNEL_PARAMS_TYPE>(params, stream, v_vec_size, k_vec_size, threads_per_block);
+                break;
+            case 128:
+                mmha_launch<T, 128, 128, KERNEL_PARAMS_TYPE>(params, stream, v_vec_size, k_vec_size, threads_per_block);
+                break;
+            default:
+                assert(false);
+        }
     }
 }
 

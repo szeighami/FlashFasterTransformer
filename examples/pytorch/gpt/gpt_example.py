@@ -28,6 +28,17 @@ sys.path.append(dir_path + "/../../..")
 from examples.pytorch.gpt.utils.gpt import GPT, GPTWeights
 import examples.pytorch.gpt.utils.gpt_token_encoder as encoder
 
+def set_default():
+    os.environ["context_attn_flash"] = "0"    
+    os.environ["context_attn_faster"] = "1"    
+    os.environ["process_new_launch"] = "0"    
+    os.environ["with_decoder_attn"] = "1"    
+    os.environ["with_decoder_ffn"] = "1"    
+    os.environ["with_context_ffn"] = "1"    
+    os.environ["with_context_attn"] = "1"    
+    os.environ["v_vec_size"] = "0"
+    os.environ["k_vec_size"] = "0"
+    os.environ["threads_per_block"] = "0"
 
 def main():
     parser = argparse.ArgumentParser()
@@ -92,6 +103,7 @@ def main():
                              ' 1: return the cumulative log probs of generated sequences'
                              ' 2: return the cumulative log probs of sequences')
 
+    set_default()
     args = parser.parse_args()
 
     layer_num = args.layer_num
@@ -119,9 +131,6 @@ def main():
     for arg in vars(args):
         print("{}: {}".format(arg, getattr(args, arg)))
     print("=========================================\n")
-
-    os.environ["context_attn_flash"] = "0"    
-    os.environ["context_attn_faster"] = "1"    
 
     enc = encoder.get_encoder(args.vocab_file, args.merges_file)
 

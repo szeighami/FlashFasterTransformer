@@ -229,9 +229,7 @@ void GptContextDecoder<T>::forward(std::vector<Tensor>* output_tensors,
             std::vector<Tensor> ffn_output_tensors{
                 Tensor{MEMORY_GPU, data_type, {batch_size * seq_len, hidden_units_}, decoder_output}};
 
-            bool with_context_ffn; std::stringstream ss(std::getenv("with_context_ffn")); ss >> with_context_ffn;
-            if (with_context_ffn)
-                ffn_layer_->forward(&ffn_output_tensors, &ffn_input_tensors, &gpt_decoder_layer_weight->at(l).ffn_weights);
+            ffn_layer_->forward(&ffn_output_tensors, &ffn_input_tensors, &gpt_decoder_layer_weight->at(l).ffn_weights);
             invokeAddBiasResidual(decoder_output,
                                   self_attn_output_,
                                   gpt_decoder_layer_weight->at(l).ffn_weights.output_weight.bias,

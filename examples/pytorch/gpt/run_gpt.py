@@ -32,13 +32,33 @@ import examples.pytorch.gpt.utils.gpt_token_encoder as encoder
 import torch.utils.benchmark as benchmark
 
 def set_default():
-    os.environ["context_attn_flash"] = "1"    
-    os.environ["context_attn_faster"] = "0"    
+    os.environ["context_attn_flash"] = "0"    
+    os.environ["context_attn_faster"] = "1"    
     os.environ["process_new_launch"] = "0"    
     os.environ["with_decoder_attn"] = "1"    
     os.environ["with_decoder_ffn"] = "1"    
     os.environ["with_context_ffn"] = "1"    
     os.environ["with_context_attn"] = "1"    
+    os.environ["v_vec_size"] = "0"
+    os.environ["k_vec_size"] = "0"
+    os.environ["threads_per_block"] = "0"
+
+
+def set_launch_params(batch_size, prompt_len, output_len):
+    param_res = pd.read_csv("res.csv")
+    df = param_res[param_res['tpv']!=-1]
+    idx = df.groupby(["batch", "prompt_len", "max_tokens"])['time'].transform(min) == df['time']
+    df_opt = df[idx]
+    curr_opt = df_opt[(df_opt['max_tokens']==output_len)&(df_opt['batch']==batch_size)&(df_opt['prompt_len']==prompt_len)]
+    if curr_opt.shape[0] == 0:
+        print("NO KNOWN SETUP")
+        exit()
+
+
+    os.environ["v_vec_size"] = str(curr_opt['tpv'].values[0])
+    os.environ["k_vec_size"] = str(curr_opt['tpk'].values[0])
+    os.environ["threads_per_block"] = str(curr_opt['tpb'].values[0])
+
 
 def set_setting(with_flash, with_new_kernel, setting):
     set_default()
@@ -81,7 +101,7 @@ def run_model(args):
     return_output_length = return_cum_log_probs > 0
     enc = encoder.get_encoder(args.vocab_file, args.merges_file)
 
-    contexts = ['Who are you?'] 
+    contexts = ['Tell me a story that will change my mind about every'] 
     start_ids = [torch.IntTensor(enc.encode(c)) for c in contexts]
 
     start_lengths = [len(ids) for ids in start_ids]
@@ -200,8 +220,6 @@ def main():
     print("=========================================\n")
 
 
-    #run_model(args)
-
     vocab_size = args.vocab_size
     beam_width = args.beam_width
     top_k = args.top_k
@@ -218,35 +236,31 @@ def main():
     return_output_length = return_cum_log_probs > 0
 
 
-    layer_num = 16
+    layer_num = 24
     head_num = 32
-    d_model = 4096
+    d_model = 2048
     max_seq_len = 2048
     size_per_head = d_model//head_num
 
-    output_lens = [1024]
+    output_lens = [1]
     #prompt_lens = [2, 16, 128, 1024]
     prompt_lens = [1024]
     batch_sizes = [1]#, 2, 4]
-    with_flashs = [False]
-    with_new_kernels = [True, False]
+    with_flashs = [True, False]
+    with_new_kernels = [False]#, True]
 
     random_seed = 0
     reps = 5
-    precisions = [16, 32]
+    precisions = [16]
 
     #gpt.bfloat16()
 
-    res = {'with_new_kernel':[], 'with_flash':[], 'batch_size':[], 'prompt_len':[], 'output_len':[], 'precision':[], 'time':[]}
+    res = {'with_new_kernel':[], 'with_flash':[], 'batch_size':[], 'prompt_len':[], 'output_len':[], 'precision':[], 'time':[], 'setting':[]}
     save_res = False
     save_file = "res_with_opts_d128.csv"
 
-    os.environ["with_decoder_attn"] = "1"    
-    os.environ["with_decoder_ffn"] = "1"    
-    os.environ["with_context_ffn"] = "1"    
-    os.environ["with_context_attn"] = "1"    
-
-    settings = [[], ["with_decoder_attn"], ["with_decoder_ffn"], ["with_context_ffn"], ["with_context_attn"]]
+    #settings = [[], ["with_decoder_attn"], ["with_decoder_ffn"], ["with_context_ffn"], ["with_context_attn"]]
+    settings = [[], ["with_context_attn"]]
 
     for precision in precisions:
         gpt = GPT(head_num, size_per_head, vocab_size, start_id, end_id, layer_num,
@@ -271,6 +285,9 @@ def main():
                                     setting_name = "all"
                                 else:
                                     setting_name = "_".join(setting)
+
+                                if with_new_kernel:
+                                    set_launch_params(batch_size, prompt_len, output_len)
 
                                 with torch.no_grad():
                                     # Generate tokens.
@@ -332,7 +349,7 @@ def main():
                                         res_df = pd.DataFrame(res)
                                         res_df.iloc[-1:].to_csv(save_file, mode='a', header=not os.path.exists(save_file))
                                     
-                                    print(f"with_new_kernel:{with_new_kernel}, with_flash:{with_flash}, batch_size:{batch_size},prompt_len:{prompt_len},output_len:{output_len},precision:{precision},time:{time}")
+                                    print(f"with_new_kernel:{with_new_kernel}, with_flash:{with_flash}, batch_size:{batch_size},prompt_len:{prompt_len},output_len:{output_len},precision:{precision},time:{time},setting:{setting_name}")
 
 if __name__ == '__main__':
     main()
