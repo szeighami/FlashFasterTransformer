@@ -11,7 +11,55 @@
 #include <sstream>
 #include <fstream>
 
-
+float half_to_float(uint16_t float16_value)
+{
+  // MSB -> LSB
+  // float16=1bit: sign, 5bit: exponent, 10bit: fraction
+  // float32=1bit: sign, 8bit: exponent, 23bit: fraction
+  // for normal exponent(1 to 0x1e): value=2**(exponent-15)*(1.fraction)
+  // for denormalized exponent(0): value=2**-14*(0.fraction)
+  uint32_t sign = float16_value >> 15;
+  uint32_t exponent = (float16_value >> 10) & 0x1F;
+  uint32_t fraction = (float16_value & 0x3FF);
+  uint32_t float32_value;
+  if (exponent == 0)
+  {
+    if (fraction == 0)
+    {
+      // zero
+      float32_value = (sign << 31);
+    }
+    else
+    {
+      // can be represented as ordinary value in float32
+      // 2 ** -14 * 0.0101
+      // => 2 ** -16 * 1.0100
+      // int int_exponent = -14;
+      exponent = 127 - 14;
+      while ((fraction & (1 << 10)) == 0)
+      {
+        //int_exponent--;
+        exponent--;
+        fraction <<= 1;
+      }
+      fraction &= 0x3FF;
+      // int_exponent += 127;
+      float32_value = (sign << 31) | (exponent << 23) | (fraction << 13);  
+    }    
+  }
+  else if (exponent == 0x1F)
+  {
+    /* Inf or NaN */
+    float32_value = (sign << 31) | (0xFF << 23) | (fraction << 13);
+  }
+  else
+  {
+    /* ordinary number */
+    float32_value = (sign << 31) | ((exponent + (127-15)) << 23) | (fraction << 13);
+  }
+  
+  return *((float*)&float32_value);
+}
 using namespace fastertransformer;
 
 //#define MMHA_USE_FP32_ACUM_FOR_OUT
@@ -1879,6 +1927,77 @@ void multihead_attention_(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& 
     }
 }
 
+template<typename T, int Dh, int Dh_MAX, int TPK, int TPB, typename KERNEL_PARAMS_TYPE, int T_size>
+struct mmha_lahnch_TPV{
+    static void call(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream, int v_vec_size)
+    {
+        throw std::exception(); 
+    }
+};
+
+template<typename T, int Dh, int Dh_MAX, int TPK, int TPB, typename KERNEL_PARAMS_TYPE>
+struct mmha_lahnch_TPV<T, Dh, Dh_MAX, TPK, TPB, KERNEL_PARAMS_TYPE, 4>{
+    static void call(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream, int v_vec_size)
+    {
+        const bool DO_CROSS_ATTENTION = false;
+
+        switch (v_vec_size){
+            case 1:
+                {
+                    constexpr int THREADS_PER_VALUE = std::min(TPB, Dh_MAX);
+                    MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
+                    break;
+                }
+            case 2:
+                {
+                    constexpr int THREADS_PER_VALUE = Dh_MAX / 2;
+                    MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
+                    break;
+                }
+            case 4:
+                {
+                    constexpr int THREADS_PER_VALUE = Dh_MAX / 4;
+                    MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
+                    break;
+                }
+            default:
+                assert(false);
+        } 
+    }
+};
+
+template<typename T, int Dh, int Dh_MAX, int TPK, int TPB, typename KERNEL_PARAMS_TYPE>
+struct mmha_lahnch_TPV<T, Dh, Dh_MAX, TPK, TPB, KERNEL_PARAMS_TYPE, 2>{
+    static void call(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream, int v_vec_size) 
+    {
+        const bool DO_CROSS_ATTENTION = false;
+
+        switch (v_vec_size){
+            case 2:
+                {
+                    constexpr int THREADS_PER_VALUE = std::min(TPB, Dh_MAX / 2);
+                    MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
+                    break;
+                }
+            case 4:
+                {
+                    constexpr int THREADS_PER_VALUE = Dh_MAX / 4;
+                    MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
+                    break;
+                }
+            case 8:
+                {
+                    constexpr int THREADS_PER_VALUE = Dh_MAX / 8;
+                    MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
+                    break;
+                }
+            default:
+                assert(false);
+        } 
+    }
+};
+
+/*
 template<typename T, int Dh, int Dh_MAX, int TPK, int TPB, typename KERNEL_PARAMS_TYPE>
 void mmha_lahnch_TPV(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream, int v_vec_size)
 {
@@ -1886,8 +2005,8 @@ void mmha_lahnch_TPV(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& strea
     switch (v_vec_size){
         case 1:
             {
-                constexpr int THREADS_PER_VALUE = Dh_MAX;
-                MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
+                //constexpr int THREADS_PER_VALUE = Dh_MAX;
+                //MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
                 break;
             }
         case 2:
@@ -1904,28 +2023,28 @@ void mmha_lahnch_TPV(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& strea
             }
         case 8:
             {
-                assert(false);
                 //constexpr int THREADS_PER_VALUE = Dh_MAX / 8;
                 //MMHA_LAUNCH_KERNEL_OPTIMIZED(T, Dh, Dh_MAX, TPK, THREADS_PER_VALUE, TPB, DO_CROSS_ATTENTION, stream);
-                //break;
+                break;
             }
         default:
             assert(false);
     } 
 }
+*/
 
 template<typename T, int Dh, int Dh_MAX, int TPB, typename KERNEL_PARAMS_TYPE>
 void mmha_launch_TPK(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream, int v_vec_size, int k_vec_size)
 {
     switch (k_vec_size){
         case 1:
-            mmha_lahnch_TPV<T, Dh, Dh_MAX, 1, TPB, KERNEL_PARAMS_TYPE>(params, stream, v_vec_size);
+            mmha_lahnch_TPV<T, Dh, Dh_MAX, 1, TPB, KERNEL_PARAMS_TYPE, sizeof(T)>::call(params, stream, v_vec_size);
             break;
         case 2:
-            mmha_lahnch_TPV<T, Dh, Dh_MAX, 2, TPB, KERNEL_PARAMS_TYPE>(params, stream, v_vec_size);
+            mmha_lahnch_TPV<T, Dh, Dh_MAX, 2, TPB, KERNEL_PARAMS_TYPE, sizeof(T)>::call(params, stream, v_vec_size);
             break;
         case 4:
-            mmha_lahnch_TPV<T, Dh, Dh_MAX, 4, TPB, KERNEL_PARAMS_TYPE>(params, stream, v_vec_size);
+            mmha_lahnch_TPV<T, Dh, Dh_MAX, 4, TPB, KERNEL_PARAMS_TYPE, sizeof(T)>::call(params, stream, v_vec_size);
             break;
         default:
             assert(false);
@@ -1960,14 +2079,11 @@ inline bool cuda_check_error(std::string message){
 }
 
 template<typename T>
-void init_val(T* cu_array, int length, T val)
+void init_val(T* cu_array, int length)
 {
     T* array =  (T*)malloc(sizeof(T)*length);
     for (int j = 0; j < length; j++){
-        if (val == -1)
-            array[j] = (float)rand()/(float)(RAND_MAX);
-        else
-            array[j] = val;
+        array[j] = (float)rand()/(float)(RAND_MAX);
     }
     cudaMemcpy(cu_array, array, sizeof(T) * length, cudaMemcpyHostToDevice);
     cuda_check_error("rand_init");
@@ -1978,7 +2094,7 @@ template<typename T, typename KERNEL_PARAMS_TYPE>
 void reset_device_res(const KERNEL_PARAMS_TYPE& params, T** context_buf, int no_layers)
 {
     for (int i = 0; i < no_layers; i++){
-        init_val<T>(context_buf[i], params.batch_size * params.num_heads * params.hidden_size_per_head, 4.0);
+        init_val<T>(context_buf[i], params.batch_size * params.num_heads * params.hidden_size_per_head);
     }
 }
 
@@ -2021,10 +2137,10 @@ void allocate_mem(const KERNEL_PARAMS_TYPE& params, int no_layers, T*** qkv_buf,
         cudaMalloc(&(*key_cache)[i], sizeof(T)*params.batch_size*params.num_heads * params.hidden_size_per_head*params.seq_length);
         cudaMalloc(&(*value_cache)[i], sizeof(T)*params.batch_size*params.num_heads * params.hidden_size_per_head*params.seq_length);
 
-        init_val<T>((*qkv_buf)[i], params.batch_size * 3 * params.num_heads*params.hidden_size_per_head, -1);
-        init_val<T>((*context_buf)[i], params.batch_size * params.num_heads * params.hidden_size_per_head, -1);
-        init_val<T>((*key_cache)[i], params.batch_size*params.num_heads * params.hidden_size_per_head*params.seq_length, -1);
-        init_val<T>((*value_cache)[i], params.batch_size*params.num_heads * params.hidden_size_per_head*params.seq_length, -1);
+        init_val<T>((*qkv_buf)[i], params.batch_size * 3 * params.num_heads*params.hidden_size_per_head);
+        init_val<T>((*context_buf)[i], params.batch_size * params.num_heads * params.hidden_size_per_head);
+        init_val<T>((*key_cache)[i], params.batch_size*params.num_heads * params.hidden_size_per_head*params.seq_length);
+        init_val<T>((*value_cache)[i], params.batch_size*params.num_heads * params.hidden_size_per_head*params.seq_length);
 
         (*true_res_host)[i] = (T*)malloc(sizeof(T)* params.batch_size * params.num_heads * params.hidden_size_per_head);
         (*res_host)[i] = (T*)malloc(sizeof(T)* params.batch_size * params.num_heads * params.hidden_size_per_head);
@@ -2070,6 +2186,7 @@ bool forward(KERNEL_PARAMS_TYPE params, const cudaStream_t& stream, int v_vec_si
 
 
 int main(int argc, char* argv[]) {
+    //using T = uint16_t;
     using T = float;
     //using T = typename TypeConverter<float2>::Type;
 
@@ -2099,16 +2216,16 @@ int main(int argc, char* argv[]) {
     params.inv_sqrt_dh = 1.F / (sqrtf((float)params.hidden_size_per_head));
     params.relative_attention_bias_stride = 0;
 
-    std::vector<int> batch_sizes = {1, 2, 4, 8};
-    std::vector<int> max_tokenss = {2, 16, 128, 1024};
-    std::vector<int> max_input_lens = {2, 16, 128, 1024};
-    //std::vector<int> batch_sizes = {1, 2};
-    //std::vector<int> max_tokenss = {2};
-    //std::vector<int> max_input_lens = {2};
+    //std::vector<int> batch_sizes = {1, 2, 4, 8};
+    //std::vector<int> max_tokenss = {2, 16, 128, 1024};
+    //std::vector<int> max_input_lens = {2, 16, 128, 1024};
+    std::vector<int> batch_sizes = {8};
+    std::vector<int> max_tokenss = {1024};
+    std::vector<int> max_input_lens = {1024};
 
 
-    bool save_res = true;
-    std::string path = "res2.csv";
+    bool save_res = false;
+    std::string path = "res_d128_fp32.csv";
 
     std::ofstream res_file;
    if (save_res){
@@ -2130,9 +2247,20 @@ int main(int argc, char* argv[]) {
                 params.max_input_len = max_input_len;
                 params.seq_length = max_input_len+max_tokens;
 
-                int tpvs[] = {1, 2, 4};
+                /*
+                int tpvs[] = {2, 4, -1};
+                if (sizeof(T) == 2)
+                    tpvs[2] = 8;
+                else
+                    tpvs[2] = 1;
+
+                //int tpvs[] = {2, 4, 8};
                 int tpks[] = {1, 2, 4};
                 int tpbs[] = {64, 128, 256};
+                */
+                int tpvs[] = {4};
+                int tpks[] = {1, 4};
+                int tpbs[] = {64};
 
                 bool validate_res = true;
 
@@ -2188,10 +2316,14 @@ int main(int argc, char* argv[]) {
                                 success = true;
                                 for (int no_layer = 0; no_layer < no_layers; no_layer++){
                                     for (int i = 0; i < params.batch_size * params.num_heads*params.hidden_size_per_head; i++){
-                                        float diff = std::abs(true_res_host[no_layer][i] - res_host[no_layer][i]);
-                                        if (diff/(float)true_res_host[no_layer][i] > 0.01){
+                                        //float true_val = half_to_float(true_res_host[no_layer][i]);
+                                        //float opt_val  = half_to_float(res_host[no_layer][i]);
+                                        float true_val = (true_res_host[no_layer][i]);
+                                        float opt_val  = (res_host[no_layer][i]);
+                                        float diff = std::abs(true_val - opt_val);
+                                        if (diff/true_val > 0.01){
                                             success = false;
-                                            printf("tpv=%d, tpk=%d,tpb=%d, WRONG ANWSER error %f, default %f, optimized%f\n",tpvs[v], tpks[k], tpbs[b], diff, true_res_host[no_layer][i], res_host[no_layer][i]);
+                                            printf("tpv=%d, tpk=%d,tpb=%d, WRONG ANWSER error %f, default %f, optimized%f\n",tpvs[v], tpks[k], tpbs[b], diff, true_val, opt_val);
                                         }
                                     }
                                 }

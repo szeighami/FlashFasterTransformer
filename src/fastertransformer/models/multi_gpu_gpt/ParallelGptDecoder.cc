@@ -323,7 +323,7 @@ void ParallelGptDecoder<T>::forward(std::vector<Tensor>* output_tensors,
             Tensor{MEMORY_GPU, data_type, {local_batch_size, hidden_units_}, normed_self_attn_output_}};
         std::vector<Tensor> ffn_output_tensors{
             Tensor{MEMORY_GPU, data_type, {local_batch_size, hidden_units_}, decoder_output}};
-        bool with_decoder_ffn; std::stringstream ss(std::getenv("with_decoder_fnn")); ss >> with_decoder_ffn;
+        bool with_decoder_ffn; std::stringstream ss(std::getenv("with_decoder_ffn")); ss >> with_decoder_ffn;
         if (with_decoder_ffn)
             ffn_layer_->forward(&ffn_output_tensors, &ffn_input_tensors, &gpt_decoder_layer_weight->at(l)->ffn_weights);
         invokeAddBiasResidual(decoder_output,

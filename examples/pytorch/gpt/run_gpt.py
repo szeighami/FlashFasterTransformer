@@ -44,9 +44,11 @@ def set_default():
     os.environ["threads_per_block"] = "0"
 
 
-def set_launch_params(batch_size, prompt_len, output_len):
-    param_res = pd.read_csv("res.csv")
+def set_launch_params(batch_size, prompt_len, output_len, precision, head_dim):
+    param_res = pd.read_csv("param_setting.csv")
     df = param_res[param_res['tpv']!=-1]
+    df = df[(df["precision"]==precision)&(df['head_dim']==head_dim)]
+
     idx = df.groupby(["batch", "prompt_len", "max_tokens"])['time'].transform(min) == df['time']
     df_opt = df[idx]
     curr_opt = df_opt[(df_opt['max_tokens']==output_len)&(df_opt['batch']==batch_size)&(df_opt['prompt_len']==prompt_len)]
@@ -236,18 +238,16 @@ def main():
     return_output_length = return_cum_log_probs > 0
 
 
-    layer_num = 24
-    head_num = 32
-    d_model = 2048
     max_seq_len = 2048
-    size_per_head = d_model//head_num
 
-    output_lens = [1]
+    #d_models = [2048, 4096]
+    d_models = [4096]
+    #output_lens = [2, 16, 128, 1024]
     #prompt_lens = [2, 16, 128, 1024]
+    output_lens = [1024]
     prompt_lens = [1024]
-    batch_sizes = [1]#, 2, 4]
-    with_flashs = [True, False]
-    with_new_kernels = [False]#, True]
+    batch_sizes = [1]
+    optimized = [True]#, False]
 
     random_seed = 0
     reps = 5
@@ -255,25 +255,43 @@ def main():
 
     #gpt.bfloat16()
 
-    res = {'with_new_kernel':[], 'with_flash':[], 'batch_size':[], 'prompt_len':[], 'output_len':[], 'precision':[], 'time':[], 'setting':[]}
-    save_res = False
-    save_file = "res_with_opts_d128.csv"
+    res = {'with_new_kernel':[], 'with_flash':[], 'batch_size':[], 'prompt_len':[], 'output_len':[], 'precision':[], 'time':[], 'setting':[], 'd_model':[]}
+    save_res = True
+    save_file = "res_all.csv"
 
-    #settings = [[], ["with_decoder_attn"], ["with_decoder_ffn"], ["with_context_ffn"], ["with_context_attn"]]
-    settings = [[], ["with_context_attn"]]
+    settings = [[], ["with_decoder_attn"], ["with_decoder_ffn"], ["with_context_ffn"], ["with_context_attn"]]
+    #settings = [["with_decoder_ffn"]]#, ["with_context_ffn"], ["with_context_attn"]]
+    #settings = [[], ["with_context_attn"]]
 
     for precision in precisions:
-        gpt = GPT(head_num, size_per_head, vocab_size, start_id, end_id, layer_num,
-                  max_seq_len, tensor_para_size, pipeline_para_size, lib_path=args.lib_path)
-        gpt.load(ckpt_path="NO_CHECKPOINT")
-        if precision==16:
-            gpt.half()
+        for d_model in d_models:
+            layer_num = 16
+            head_num = 32
+            size_per_head = d_model//head_num
 
-        for with_flash in with_flashs:
-            for with_new_kernel in with_new_kernels:
+            gpt = GPT(head_num, size_per_head, vocab_size, start_id, end_id, layer_num,
+                      max_seq_len, tensor_para_size, pipeline_para_size, lib_path=args.lib_path)
+            gpt.load(ckpt_path="NO_CHECKPOINT")
+            if precision==16:
+                gpt.half()
+
+            for opt in optimized:
                 for batch_size in batch_sizes:
                     for prompt_len in prompt_lens:
                         for output_len in output_lens:
+                            if opt:
+                                with_new_kernel = True
+                                if precision == 16:
+                                    if d_model==4096 and output_len == 1024 and prompt_len == 1024:
+                                        with_flash = False
+                                    else:
+                                        with_flash = True
+                                else:
+                                    with_flash = False
+                            else:
+                                with_new_kernel = False
+                                with_flash = False
+
                             start_ids = [torch.IntTensor([10 for _ in range(prompt_len)]) for _ in range(batch_size)]
                             start_lengths = [len(ids) for ids in start_ids]
                             start_ids = pad_sequence(start_ids, batch_first=True, padding_value=end_id)
@@ -287,7 +305,7 @@ def main():
                                     setting_name = "_".join(setting)
 
                                 if with_new_kernel:
-                                    set_launch_params(batch_size, prompt_len, output_len)
+                                    set_launch_params(batch_size, prompt_len, output_len, precision, size_per_head)
 
                                 with torch.no_grad():
                                     # Generate tokens.
@@ -343,13 +361,14 @@ def main():
                                     res['time'].append(time)
                                     res['precision'].append(precision)
                                     res['setting'].append(setting_name)
+                                    res['d_model'].append(d_model)
                                     res['with_new_kernel'].append(with_new_kernel)
 
                                     if save_res:
                                         res_df = pd.DataFrame(res)
                                         res_df.iloc[-1:].to_csv(save_file, mode='a', header=not os.path.exists(save_file))
                                     
-                                    print(f"with_new_kernel:{with_new_kernel}, with_flash:{with_flash}, batch_size:{batch_size},prompt_len:{prompt_len},output_len:{output_len},precision:{precision},time:{time},setting:{setting_name}")
+                                    print(f"with_new_kernel:{with_new_kernel}, with_flash:{with_flash}, batch_size:{batch_size},prompt_len:{prompt_len},output_len:{output_len},precision:{precision},d_model:{d_model},time:{time},setting:{setting_name}")
 
 if __name__ == '__main__':
     main()
