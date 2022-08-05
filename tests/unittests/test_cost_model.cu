@@ -12,6 +12,8 @@
 #include <fstream>
 
 #define tpb64
+#define tpb128
+#define tpb256
 #define tpk1
 #define tpv4
 
@@ -733,7 +735,7 @@ template<
     // The number of threads in a threadblock.
     int THREADS_PER_BLOCK,
     bool DO_CROSS_ATTENTION,
-    bool skip_mem>
+    bool skip_mem, bool skip_loop>
 __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_params<T, DO_CROSS_ATTENTION> params)
 {
     // Make sure the hidden dimension per head is a multiple of the number of threads per key.
@@ -1031,74 +1033,76 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
     T* dummy_kvec[K_VEC_SIZE];
 
     // Iterate over the keys/timesteps to compute the various (Q*K^T)_{ti} values.
-    for (int ti = ko; ti < ti_end; ti += K_PER_ITER) {
+    if (!skip_loop){
+        for (int ti = ko; ti < ti_end; ti += K_PER_ITER) {
 
-        // The keys loaded from the key cache.
-        K_vec k[K_VECS_PER_THREAD];
-        K_vec k_vec_zero;
-        zero(k_vec_zero);
+            // The keys loaded from the key cache.
+            K_vec k[K_VECS_PER_THREAD];
+            K_vec k_vec_zero;
+            zero(k_vec_zero);
 #pragma unroll
-        for (int ii = 0; ii < K_VECS_PER_THREAD; ++ii) {
-            int jj = ii * params.seq_length + ti;
-            // if( ti < params.timestep ) {
-            if (ti < tlength) {
-                if (!skip_mem){
-                    if (params.cache_indir != nullptr){
-                        const int beam_src =
-                            (params.cache_indir != nullptr) ?
-                                params.cache_indir[(bbi * params.beam_width + beami) * params.seq_length + ti] :
-                                0;
-                        const int beam_offset = beam_src * params.num_heads * params.seq_length * Dh;
-                        k[ii] = (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) ?
-                                    *reinterpret_cast<const K_vec*>(&k_cache_batch[beam_offset + jj * QK_ELTS_IN_16B]) :
-                                    k_vec_zero;
+            for (int ii = 0; ii < K_VECS_PER_THREAD; ++ii) {
+                int jj = ii * params.seq_length + ti;
+                // if( ti < params.timestep ) {
+                if (ti < tlength) {
+                    if (!skip_mem){
+                        if (params.cache_indir != nullptr){
+                            const int beam_src =
+                                (params.cache_indir != nullptr) ?
+                                    params.cache_indir[(bbi * params.beam_width + beami) * params.seq_length + ti] :
+                                    0;
+                            const int beam_offset = beam_src * params.num_heads * params.seq_length * Dh;
+                            k[ii] = (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) ?
+                                        *reinterpret_cast<const K_vec*>(&k_cache_batch[beam_offset + jj * QK_ELTS_IN_16B]) :
+                                        k_vec_zero;
+                        }
+                        else{
+                            k[ii] = (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) ?
+                                        *reinterpret_cast<const K_vec*>(&k_cache_batch[0 + jj * QK_ELTS_IN_16B]) :
+                                        k_vec_zero;
+                        }
+                        // add bias and update k_cache
                     }
                     else{
                         k[ii] = (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) ?
-                                    *reinterpret_cast<const K_vec*>(&k_cache_batch[0 + jj * QK_ELTS_IN_16B]) :
+                                    *reinterpret_cast<const K_vec*>(dummy_kvec) :
                                     k_vec_zero;
                     }
-                    // add bias and update k_cache
-                }
-                else{
-                    k[ii] = (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) ?
-                                *reinterpret_cast<const K_vec*>(dummy_kvec) :
-                                k_vec_zero;
-                }
 
-                if (DO_CROSS_ATTENTION && params.timestep == 0) {
-                    k[ii] = add(k[ii], k_bias[ii]);
-                    if (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) {
-                        *reinterpret_cast<K_vec*>(&k_cache[jj * QK_ELTS_IN_16B]) = k[ii];
+                    if (DO_CROSS_ATTENTION && params.timestep == 0) {
+                        k[ii] = add(k[ii], k_bias[ii]);
+                        if (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) {
+                            *reinterpret_cast<K_vec*>(&k_cache[jj * QK_ELTS_IN_16B]) = k[ii];
+                        }
                     }
                 }
             }
-        }
 
-        // Perform the dot product and normalize qk.
-        //
-        // WARNING: ALL THE THREADS OF A WARP MUST ENTER!!!
-        float qk = Qk_dot<T, THREADS_PER_KEY>::dot(q, k) * params.inv_sqrt_dh;
-        bool is_mask = (params.input_lengths != nullptr && ti >= params.input_lengths[bi] && ti < params.max_input_len);
+            // Perform the dot product and normalize qk.
+            //
+            // WARNING: ALL THE THREADS OF A WARP MUST ENTER!!!
+            float qk = Qk_dot<T, THREADS_PER_KEY>::dot(q, k) * params.inv_sqrt_dh;
+            bool is_mask = (params.input_lengths != nullptr && ti >= params.input_lengths[bi] && ti < params.max_input_len);
 
-        // Store the product to shared memory. There's one qk value per timestep. Update the max.
-        // if( ti < params.timestep && tidx % THREADS_PER_KEY == 0 ) {
-        if (ti < tlength && tidx % THREADS_PER_KEY == 0) {
-            if (params.relative_attention_bias_float != nullptr) {
-                qk = qk
-                     + params.relative_attention_bias_float[hi * params.relative_attention_bias_stride
-                                                                * params.relative_attention_bias_stride
-                                                            + tlength * params.relative_attention_bias_stride + ti];
+            // Store the product to shared memory. There's one qk value per timestep. Update the max.
+            // if( ti < params.timestep && tidx % THREADS_PER_KEY == 0 ) {
+            if (ti < tlength && tidx % THREADS_PER_KEY == 0) {
+                if (params.relative_attention_bias_float != nullptr) {
+                    qk = qk
+                         + params.relative_attention_bias_float[hi * params.relative_attention_bias_stride
+                                                                    * params.relative_attention_bias_stride
+                                                                + tlength * params.relative_attention_bias_stride + ti];
+                }
+                else if (params.relative_attention_bias_half != nullptr) {
+                    qk = qk
+                         + (float)
+                               params.relative_attention_bias_half[hi * params.relative_attention_bias_stride
+                                                                       * params.relative_attention_bias_stride
+                                                                   + tlength * params.relative_attention_bias_stride + ti];
+                }
+                qk_max = is_mask ? qk_max : fmaxf(qk_max, qk);
+                qk_smem[ti] = qk;
             }
-            else if (params.relative_attention_bias_half != nullptr) {
-                qk = qk
-                     + (float)
-                           params.relative_attention_bias_half[hi * params.relative_attention_bias_stride
-                                                                   * params.relative_attention_bias_stride
-                                                               + tlength * params.relative_attention_bias_stride + ti];
-            }
-            qk_max = is_mask ? qk_max : fmaxf(qk_max, qk);
-            qk_smem[ti] = qk;
         }
     }
 
@@ -1136,11 +1140,13 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
     // Compute the logits and start the sum.
     float sum = 0.f;
     // for( int ti = tidx; ti <= params.timestep; ti += THREADS_PER_BLOCK ) {
-    for (int ti = tidx; ti <= tlength; ti += THREADS_PER_BLOCK) {
-        bool is_mask = (params.input_lengths != nullptr && ti >= params.input_lengths[bi] && ti < params.max_input_len);
-        float logit = is_mask ? 0.f : __expf(qk_smem[ti] - qk_max);
-        sum += logit;
-        qk_smem[ti] = logit;
+    if (!skip_loop){
+        for (int ti = tidx; ti <= tlength; ti += THREADS_PER_BLOCK) {
+            bool is_mask = (params.input_lengths != nullptr && ti >= params.input_lengths[bi] && ti < params.max_input_len);
+            float logit = is_mask ? 0.f : __expf(qk_smem[ti] - qk_max);
+            sum += logit;
+            qk_smem[ti] = logit;
+        }
     }
 
     // Compute the sum.
@@ -1149,8 +1155,10 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
     // Normalize the logits.
     float inv_sum = __fdividef(1.f, sum + 1.e-6f);
     // for( int ti = tidx; ti <= params.timestep; ti += THREADS_PER_BLOCK ) {
-    for (int ti = tidx; ti <= tlength; ti += THREADS_PER_BLOCK) {
-        convert_from_float(logits_smem[ti], qk_smem[ti] * inv_sum);
+    if (!skip_loop){
+        for (int ti = tidx; ti <= tlength; ti += THREADS_PER_BLOCK) {
+            convert_from_float(logits_smem[ti], qk_smem[ti] * inv_sum);
+        }
     }
 
     // Put Values part below so we leverage __syncthreads
@@ -1210,110 +1218,112 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
 
     // Loop over the timesteps to compute the partial outputs.
     // for( int ti = vo; ti < params.timestep; ti += V_PER_ITER ) {
-    if (Dh == Dh_MAX || vi < Dh) {
-        for (int ti = vo; ti < tlength; ti += V_PER_ITER) {
+    if (!skip_loop){
+        if (Dh == Dh_MAX || vi < Dh) {
+            for (int ti = vo; ti < tlength; ti += V_PER_ITER) {
 
-            // Fetch offset based on cache_indir when beam sampling
-            V_vec v;
-            if (!skip_mem){
-                if (params.cache_indir != nullptr){
-                    const int beam_src = (params.cache_indir != nullptr) ?
-                                             params.cache_indir[(bbi * params.beam_width + beami) * params.seq_length + ti] :
-                                             0;
-                    const int beam_offset = beam_src * params.num_heads * params.seq_length * Dh;
-                    // Load the values from the cache.
-                    v = *reinterpret_cast<const V_vec*>(&v_cache_batch[beam_offset + ti * Dh]);
+                // Fetch offset based on cache_indir when beam sampling
+                V_vec v;
+                if (!skip_mem){
+                    if (params.cache_indir != nullptr){
+                        const int beam_src = (params.cache_indir != nullptr) ?
+                                                 params.cache_indir[(bbi * params.beam_width + beami) * params.seq_length + ti] :
+                                                 0;
+                        const int beam_offset = beam_src * params.num_heads * params.seq_length * Dh;
+                        // Load the values from the cache.
+                        v = *reinterpret_cast<const V_vec*>(&v_cache_batch[beam_offset + ti * Dh]);
+                    }
+                    else{
+                        v = *reinterpret_cast<const V_vec*>(&v_cache_batch[0 + ti * Dh]);
+                    }
                 }
                 else{
-                    v = *reinterpret_cast<const V_vec*>(&v_cache_batch[0 + ti * Dh]);
+                    v = *reinterpret_cast<const V_vec*>(dummy_vvec);
                 }
-            }
-            else{
-                v = *reinterpret_cast<const V_vec*>(dummy_vvec);
-            }
 
 
-            if (DO_CROSS_ATTENTION && params.timestep == 0) {
-                v = add(v, *reinterpret_cast<V_vec*>(&bias_smem[vi]));
-                *reinterpret_cast<V_vec*>(&v_cache[ti * Dh]) = v;
-            }
-            // Load the logits from shared memory.
+                if (DO_CROSS_ATTENTION && params.timestep == 0) {
+                    v = add(v, *reinterpret_cast<V_vec*>(&bias_smem[vi]));
+                    *reinterpret_cast<V_vec*>(&v_cache[ti * Dh]) = v;
+                }
+                // Load the logits from shared memory.
 #if defined(MMHA_USE_FP32_ACUM_FOR_LOGITS)
-            float logit = logits_smem[ti];
-            out = fma(logit, cast_to_float(v), out);
+                float logit = logits_smem[ti];
+                out = fma(logit, cast_to_float(v), out);
 #else
-            T logit = logits_smem[ti];
+                T logit = logits_smem[ti];
 
-            // Update the partial sums.
-            out = fma(logit, v, out);
+                // Update the partial sums.
+                out = fma(logit, v, out);
+#endif
+            }
+        }
+
+        // One group of threads computes the product(s) for the current timestep.
+        // if( vo == params.timestep % V_PER_ITER ) {
+        if (vo == tlength % V_PER_ITER && (Dh == Dh_MAX || vi < Dh)) {
+
+            V_vec v;
+            if (DO_CROSS_ATTENTION) {
+                v = *reinterpret_cast<const V_vec*>(&v_cache[tlength * Dh]);
+            }
+            else {
+                // Trigger the loads from the V buffer.
+                if (!skip_mem)
+                    v = *reinterpret_cast<const V_vec*>(&params.v[qkv_base_offset + vi]);
+                else
+                    v = *reinterpret_cast<const V_vec*>(dummy_vvec);
+                // Trigger the loads from the V bias buffer.
+                // V_vec v_bias = *reinterpret_cast<const V_vec*>(&params.v_bias[hi*Dh + vi]);
+            }
+
+            // Compute the V values with bias.
+            if (!DO_CROSS_ATTENTION || (DO_CROSS_ATTENTION && params.timestep == 0)) {
+                v = add(v, v_bias);
+
+                // Store the values with bias back to global memory in the cache for V.
+                //*reinterpret_cast<V_vec*>(&v_cache[params.timestep*Dh]) = v;
+                *reinterpret_cast<V_vec*>(&v_cache[tlength * Dh]) = v;
+            }
+
+            // Initialize the output value with the current timestep.
+#if defined(MMHA_USE_FP32_ACUM_FOR_LOGITS)
+            // out = fma(logits_smem[params.timestep], cast_to_float(v), out);
+            out = fma(logits_smem[tlength], cast_to_float(v), out);
+#else
+            // out = fma(logits_smem[params.timestep], v, out);
+            out = fma(logits_smem[tlength], v, out);
 #endif
         }
-    }
 
-    // One group of threads computes the product(s) for the current timestep.
-    // if( vo == params.timestep % V_PER_ITER ) {
-    if (vo == tlength % V_PER_ITER && (Dh == Dh_MAX || vi < Dh)) {
+        // Make sure we can start writing to shared memory.
+        __syncthreads();
 
-        V_vec v;
-        if (DO_CROSS_ATTENTION) {
-            v = *reinterpret_cast<const V_vec*>(&v_cache[tlength * Dh]);
-        }
-        else {
-            // Trigger the loads from the V buffer.
-            if (!skip_mem)
-                v = *reinterpret_cast<const V_vec*>(&params.v[qkv_base_offset + vi]);
-            else
-                v = *reinterpret_cast<const V_vec*>(dummy_vvec);
-            // Trigger the loads from the V bias buffer.
-            // V_vec v_bias = *reinterpret_cast<const V_vec*>(&params.v_bias[hi*Dh + vi]);
-        }
-
-        // Compute the V values with bias.
-        if (!DO_CROSS_ATTENTION || (DO_CROSS_ATTENTION && params.timestep == 0)) {
-            v = add(v, v_bias);
-
-            // Store the values with bias back to global memory in the cache for V.
-            //*reinterpret_cast<V_vec*>(&v_cache[params.timestep*Dh]) = v;
-            *reinterpret_cast<V_vec*>(&v_cache[tlength * Dh]) = v;
-        }
-
-        // Initialize the output value with the current timestep.
-#if defined(MMHA_USE_FP32_ACUM_FOR_LOGITS)
-        // out = fma(logits_smem[params.timestep], cast_to_float(v), out);
-        out = fma(logits_smem[tlength], cast_to_float(v), out);
-#else
-        // out = fma(logits_smem[params.timestep], v, out);
-        out = fma(logits_smem[tlength], v, out);
-#endif
-    }
-
-    // Make sure we can start writing to shared memory.
-    __syncthreads();
-
-    // Run the final reduction amongst the different groups computing different partial outputs.
-    if (Dh == Dh_MAX || vi < Dh)
+        // Run the final reduction amongst the different groups computing different partial outputs.
+        if (Dh == Dh_MAX || vi < Dh)
 #pragma unroll
-        for (int active_groups = V_PER_ITER; active_groups >= 2; active_groups /= 2) {
+            for (int active_groups = V_PER_ITER; active_groups >= 2; active_groups /= 2) {
 
-            // The midpoint in the number of active groups.
-            int midpoint = active_groups / 2;
+                // The midpoint in the number of active groups.
+                int midpoint = active_groups / 2;
 
-            // The upper part of active threads store to shared memory.
-            if (vo >= midpoint && vo < active_groups && (Dh == Dh_MAX || vi < Dh)) {
+                // The upper part of active threads store to shared memory.
+                if (vo >= midpoint && vo < active_groups && (Dh == Dh_MAX || vi < Dh)) {
 #ifdef MMHA_USE_FP32_ACUM_FOR_OUT
-                convert_from_float(*reinterpret_cast<V_vec*>(&out_smem[(vo - midpoint) * Dh + vi]), out);
+                    convert_from_float(*reinterpret_cast<V_vec*>(&out_smem[(vo - midpoint) * Dh + vi]), out);
 #else
-                *reinterpret_cast<V_vec*>(&out_smem[(vo - midpoint) * Dh + vi]) = out;
+                    *reinterpret_cast<V_vec*>(&out_smem[(vo - midpoint) * Dh + vi]) = out;
 #endif
-            }
-            __syncthreads();
+                }
+                __syncthreads();
 
-            // The bottom warps update their values.
-            if (vo < midpoint && (Dh == Dh_MAX || vi < Dh)) {
-                out = add(*reinterpret_cast<const V_vec*>(&out_smem[vo * Dh + vi]), out);
+                // The bottom warps update their values.
+                if (vo < midpoint && (Dh == Dh_MAX || vi < Dh)) {
+                    out = add(*reinterpret_cast<const V_vec*>(&out_smem[vo * Dh + vi]), out);
+                }
+                __syncthreads();
             }
-            __syncthreads();
-        }
+    }
 
     // Output the final values.
     if (vo == 0 && (Dh == Dh_MAX || vi < Dh)) {
@@ -1338,7 +1348,7 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
                                             THDS_PER_KEY,                                                              \
                                             THDS_PER_VALUE,                                                            \
                                             THDS_PER_BLOCK,                                                            \
-                                            DO_CROSS_ATTENTION, true><<<grid, THDS_PER_BLOCK, smem_sz, stream>>>(params)
+                                            DO_CROSS_ATTENTION, true, true><<<grid, THDS_PER_BLOCK, smem_sz, stream>>>(params)
 
 
 template<typename T, int Dh, int Dh_MAX, int TPK, int TPB, typename KERNEL_PARAMS_TYPE, int T_size>
@@ -1693,7 +1703,7 @@ void call_precision_headsize(){
                 //int tpvs[] = {2, 4, 8};
                 int tpvs[] = {4};
                 int tpks[] = {1};
-                int tpbs[] = {64};
+                int tpbs[] = {64, 128, 256};
 
 
                 T** qkv_buf; T** key_cache; T** value_cache; T** context_buf; T** true_res_host; T** res_host;
