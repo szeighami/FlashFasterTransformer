@@ -732,7 +732,8 @@ template<
     int THREADS_PER_VALUE,
     // The number of threads in a threadblock.
     int THREADS_PER_BLOCK,
-    bool DO_CROSS_ATTENTION>
+    bool DO_CROSS_ATTENTION,
+    bool skip_mem>
 __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_params<T, DO_CROSS_ATTENTION> params)
 {
     // Make sure the hidden dimension per head is a multiple of the number of threads per key.
@@ -1014,6 +1015,9 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
     // Pick a number of keys to make sure all the threads of a warp enter (due to shfl_sync).
     // int ti_end = div_up(params.timestep, K_PER_WARP) * K_PER_WARP;
     int ti_end = div_up(tlength, K_PER_WARP) * K_PER_WARP;
+    
+
+    T* dummy_kvec[K_VEC_SIZE];
 
     // Iterate over the keys/timesteps to compute the various (Q*K^T)_{ti} values.
     for (int ti = ko; ti < ti_end; ti += K_PER_ITER) {
@@ -1027,22 +1031,30 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
             int jj = ii * params.seq_length + ti;
             // if( ti < params.timestep ) {
             if (ti < tlength) {
-                if (params.cache_indir != nullptr){
-                    const int beam_src =
-                        (params.cache_indir != nullptr) ?
-                            params.cache_indir[(bbi * params.beam_width + beami) * params.seq_length + ti] :
-                            0;
-                    const int beam_offset = beam_src * params.num_heads * params.seq_length * Dh;
-                    k[ii] = (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) ?
-                                *reinterpret_cast<const K_vec*>(&k_cache_batch[beam_offset + jj * QK_ELTS_IN_16B]) :
-                                k_vec_zero;
+                if (!skip_mem){
+                    if (params.cache_indir != nullptr){
+                        const int beam_src =
+                            (params.cache_indir != nullptr) ?
+                                params.cache_indir[(bbi * params.beam_width + beami) * params.seq_length + ti] :
+                                0;
+                        const int beam_offset = beam_src * params.num_heads * params.seq_length * Dh;
+                        k[ii] = (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) ?
+                                    *reinterpret_cast<const K_vec*>(&k_cache_batch[beam_offset + jj * QK_ELTS_IN_16B]) :
+                                    k_vec_zero;
+                    }
+                    else{
+                        k[ii] = (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) ?
+                                    *reinterpret_cast<const K_vec*>(&k_cache_batch[0 + jj * QK_ELTS_IN_16B]) :
+                                    k_vec_zero;
+                    }
+                    // add bias and update k_cache
                 }
                 else{
                     k[ii] = (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) ?
-                                *reinterpret_cast<const K_vec*>(&k_cache_batch[0 + jj * QK_ELTS_IN_16B]) :
+                                *reinterpret_cast<const K_vec*>(dummy_kvec) :
                                 k_vec_zero;
                 }
-                // add bias and update k_cache
+
                 if (DO_CROSS_ATTENTION && params.timestep == 0) {
                     k[ii] = add(k[ii], k_bias[ii]);
                     if (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) {
@@ -1183,6 +1195,8 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
     V_vec_acum out;
     zero(out);
 
+    T* dummy_vvec[V_VEC_SIZE];
+
     // Loop over the timesteps to compute the partial outputs.
     // for( int ti = vo; ti < params.timestep; ti += V_PER_ITER ) {
     if (Dh == Dh_MAX || vi < Dh) {
@@ -1190,17 +1204,23 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
 
             // Fetch offset based on cache_indir when beam sampling
             V_vec v;
-            if (params.cache_indir != nullptr){
-                const int beam_src = (params.cache_indir != nullptr) ?
-                                         params.cache_indir[(bbi * params.beam_width + beami) * params.seq_length + ti] :
-                                         0;
-                const int beam_offset = beam_src * params.num_heads * params.seq_length * Dh;
-                // Load the values from the cache.
-                v = *reinterpret_cast<const V_vec*>(&v_cache_batch[beam_offset + ti * Dh]);
+            if (!skip_mem){
+                if (params.cache_indir != nullptr){
+                    const int beam_src = (params.cache_indir != nullptr) ?
+                                             params.cache_indir[(bbi * params.beam_width + beami) * params.seq_length + ti] :
+                                             0;
+                    const int beam_offset = beam_src * params.num_heads * params.seq_length * Dh;
+                    // Load the values from the cache.
+                    v = *reinterpret_cast<const V_vec*>(&v_cache_batch[beam_offset + ti * Dh]);
+                }
+                else{
+                    v = *reinterpret_cast<const V_vec*>(&v_cache_batch[0 + ti * Dh]);
+                }
             }
             else{
-                v = *reinterpret_cast<const V_vec*>(&v_cache_batch[0 + ti * Dh]);
+                v = *reinterpret_cast<const V_vec*>(dummy_vvec);
             }
+
 
             if (DO_CROSS_ATTENTION && params.timestep == 0) {
                 v = add(v, *reinterpret_cast<V_vec*>(&bias_smem[vi]));
@@ -1304,7 +1324,7 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
                                             THDS_PER_KEY,                                                              \
                                             THDS_PER_VALUE,                                                            \
                                             THDS_PER_BLOCK,                                                            \
-                                            DO_CROSS_ATTENTION><<<grid, THDS_PER_BLOCK, smem_sz, stream>>>(params)
+                                            DO_CROSS_ATTENTION, true><<<grid, THDS_PER_BLOCK, smem_sz, stream>>>(params)
 
 
 template<typename T, int Dh, int Dh_MAX, int TPK, int TPB, typename KERNEL_PARAMS_TYPE, int T_size>
