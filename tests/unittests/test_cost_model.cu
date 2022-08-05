@@ -830,6 +830,8 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
     int tlength = (DO_CROSS_ATTENTION)                  ? params.memory_length_per_sample[bi] - 1 :
                   (params.length_per_sample == nullptr) ? params.timestep :
                                                           params.length_per_sample[bi];
+
+    T* dummy_qkvec[QK_VEC_SIZE];
     // First QK_VECS_PER_WARP load Q and K + the bias values for the current timestep.
     if (tidx < QK_VECS_PER_WARP) {
 
@@ -840,8 +842,13 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
 
         // Trigger the loads from the Q and K buffers.
         Qk_vec q;
+
         zero(q);
-        q = (Dh == Dh_MAX || tidx * QK_VEC_SIZE < Dh) ? *reinterpret_cast<const Qk_vec*>(&params.q[qk_offset]) : q;
+        if (!skip_mem)
+            q = (Dh == Dh_MAX || tidx * QK_VEC_SIZE < Dh) ? *reinterpret_cast<const Qk_vec*>(&params.q[qk_offset]) : q;
+        else
+            q = (Dh == Dh_MAX || tidx * QK_VEC_SIZE < Dh) ? *reinterpret_cast<const Qk_vec*>(dummy_qkvec) : q;
+
         Qk_vec k;
         zero(k);
         if (DO_CROSS_ATTENTION) {
@@ -858,7 +865,10 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
                                                             k;
         }
         else {
-            k = (Dh == Dh_MAX || tidx * QK_VEC_SIZE < Dh) ? *reinterpret_cast<const Qk_vec*>(&params.k[qk_offset]) : k;
+            if (!skip_mem)
+                k = (Dh == Dh_MAX || tidx * QK_VEC_SIZE < Dh) ? *reinterpret_cast<const Qk_vec*>(&params.k[qk_offset]) : k;
+            else
+                k = (Dh == Dh_MAX || tidx * QK_VEC_SIZE < Dh) ? *reinterpret_cast<const Qk_vec*>(dummy_qkvec) : k;
         }
 
         // Trigger the loads from the Q and K bias buffers.
@@ -919,7 +929,8 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
         if (!DO_CROSS_ATTENTION || (DO_CROSS_ATTENTION && params.timestep == 0)) {
             // Trigger the stores to global memory.
             if (Dh == Dh_MAX || co < Dh / QK_ELTS_IN_16B) {
-                *reinterpret_cast<Qk_vec*>(&params.k_cache[offset]) = k;
+                if (!skip_mem)
+                    *reinterpret_cast<Qk_vec*>(&params.k_cache[offset]) = k;
             }
         }
 
@@ -1249,7 +1260,10 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
         }
         else {
             // Trigger the loads from the V buffer.
-            v = *reinterpret_cast<const V_vec*>(&params.v[qkv_base_offset + vi]);
+            if (!skip_mem)
+                v = *reinterpret_cast<const V_vec*>(&params.v[qkv_base_offset + vi]);
+            else
+                v = *reinterpret_cast<const V_vec*>(dummy_vvec);
             // Trigger the loads from the V bias buffer.
             // V_vec v_bias = *reinterpret_cast<const V_vec*>(&params.v_bias[hi*Dh + vi]);
         }
