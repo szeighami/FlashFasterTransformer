@@ -735,9 +735,11 @@ template<
     // The number of threads in a threadblock.
     int THREADS_PER_BLOCK,
     bool DO_CROSS_ATTENTION,
-    bool skip_mem, bool skip_loop>
+    bool skip_mem, bool skip_loop, bool only_launch>
 __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_params<T, DO_CROSS_ATTENTION> params)
 {
+    if (only_launch)
+        return;
     // Make sure the hidden dimension per head is a multiple of the number of threads per key.
     static_assert(Dh_MAX % THREADS_PER_KEY == 0, "");
     // Make sure the hidden dimension per head is a multiple of the number of threads per value.
@@ -1348,7 +1350,7 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
                                             THDS_PER_KEY,                                                              \
                                             THDS_PER_VALUE,                                                            \
                                             THDS_PER_BLOCK,                                                            \
-                                            DO_CROSS_ATTENTION, true, true><<<grid, THDS_PER_BLOCK, smem_sz, stream>>>(params)
+                                            DO_CROSS_ATTENTION, true, true, true><<<grid, THDS_PER_BLOCK, smem_sz, stream>>>(params)
 
 
 template<typename T, int Dh, int Dh_MAX, int TPK, int TPB, typename KERNEL_PARAMS_TYPE, int T_size>
