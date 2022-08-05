@@ -835,7 +835,7 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
                   (params.length_per_sample == nullptr) ? params.timestep :
                                                           params.length_per_sample[bi];
 
-    T* dummy_qkvec[QK_VEC_SIZE];
+    T dummy_qkvec[QK_VEC_SIZE];
     // First QK_VECS_PER_WARP load Q and K + the bias values for the current timestep.
     if (tidx < QK_VECS_PER_WARP) {
 
@@ -850,8 +850,12 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
         zero(q);
         if (!skip_mem)
             q = (Dh == Dh_MAX || tidx * QK_VEC_SIZE < Dh) ? *reinterpret_cast<const Qk_vec*>(&params.q[qk_offset]) : q;
-        else
+        else{
+#pragma unroll
+            for (int i = 0; i < QK_VEC_SIZE; i++)
+                dummy_qkvec[i] = (T)(params.seq_length+i)*2;
             q = (Dh == Dh_MAX || tidx * QK_VEC_SIZE < Dh) ? *reinterpret_cast<const Qk_vec*>(dummy_qkvec) : q;
+        }
 
         Qk_vec k;
         zero(k);
@@ -1032,7 +1036,7 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
     int ti_end = div_up(tlength, K_PER_WARP) * K_PER_WARP;
     
 
-    T* dummy_kvec[K_VEC_SIZE];
+    T dummy_kvec[K_VEC_SIZE];
 
     // Iterate over the keys/timesteps to compute the various (Q*K^T)_{ti} values.
     if (!skip_loop){
@@ -1066,6 +1070,9 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
                         // add bias and update k_cache
                     }
                     else{
+#pragma unroll
+                        for (int i = 0; i < K_VEC_SIZE; i++)
+                            dummy_kvec[i] = (T)(params.seq_length+i)*2;
                         k[ii] = (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) ?
                                     *reinterpret_cast<const K_vec*>(dummy_kvec) :
                                     k_vec_zero;
@@ -1216,7 +1223,7 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
     V_vec_acum out;
     zero(out);
 
-    T* dummy_vvec[V_VEC_SIZE];
+    T dummy_vvec[V_VEC_SIZE];
 
     // Loop over the timesteps to compute the partial outputs.
     // for( int ti = vo; ti < params.timestep; ti += V_PER_ITER ) {
@@ -1240,6 +1247,8 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
                     }
                 }
                 else{
+                    for (int i = 0; i < V_VEC_SIZE; i++)
+                        dummy_vvec[i] = (T)(params.seq_length+i)*2;
                     v = *reinterpret_cast<const V_vec*>(dummy_vvec);
                 }
 
@@ -1350,7 +1359,7 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
                                             THDS_PER_KEY,                                                              \
                                             THDS_PER_VALUE,                                                            \
                                             THDS_PER_BLOCK,                                                            \
-                                            DO_CROSS_ATTENTION, true, true, true><<<grid, THDS_PER_BLOCK, smem_sz, stream>>>(params)
+                                            DO_CROSS_ATTENTION, true, false, false><<<grid, THDS_PER_BLOCK, smem_sz, stream>>>(params)
 
 
 template<typename T, int Dh, int Dh_MAX, int TPK, int TPB, typename KERNEL_PARAMS_TYPE, int T_size>
