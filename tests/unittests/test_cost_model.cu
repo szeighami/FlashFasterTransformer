@@ -14,7 +14,8 @@
 #define tpb64
 #define tpb128
 #define tpb256
-#define tpk1
+#define tpb512
+#define tpk2
 #define tpv4
 
 float half_to_float(uint16_t float16_value)
@@ -1359,7 +1360,7 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
                                             THDS_PER_KEY,                                                              \
                                             THDS_PER_VALUE,                                                            \
                                             THDS_PER_BLOCK,                                                            \
-                                            DO_CROSS_ATTENTION, true, false, false><<<grid, THDS_PER_BLOCK, smem_sz, stream>>>(params)
+                                            DO_CROSS_ATTENTION, false, false, false><<<grid, THDS_PER_BLOCK, smem_sz, stream>>>(params)
 
 
 template<typename T, int Dh, int Dh_MAX, int TPK, int TPB, typename KERNEL_PARAMS_TYPE, int T_size>
@@ -1486,6 +1487,11 @@ void mmha_launch(const KERNEL_PARAMS_TYPE& params, const cudaStream_t& stream, i
         case 256:
 #ifdef tpb256
             mmha_launch_TPK<T, Dh, Dh_MAX, 256, KERNEL_PARAMS_TYPE>(params, stream, v_vec_size, k_vec_size);
+#endif  
+            break;
+        case 512:
+#ifdef tpb512
+            mmha_launch_TPK<T, Dh, Dh_MAX, 512, KERNEL_PARAMS_TYPE>(params, stream, v_vec_size, k_vec_size);
 #endif  
             break;
         default:
@@ -1644,7 +1650,7 @@ bool check_res(uint16_t** true_res_host, uint16_t** res_host, int no_layers, int
 
 
 template<typename T, int size_per_head>
-void call_precision_headsize(){
+void call_precision_headsize(int tpb){
     Masked_multihead_attention_params<T> params;
     
     memset(&params, 0, sizeof(params));
@@ -1713,8 +1719,9 @@ void call_precision_headsize(){
                 
                 //int tpvs[] = {2, 4, 8};
                 int tpvs[] = {4};
-                int tpks[] = {1};
-                int tpbs[] = {64, 128, 256};
+                int tpks[] = {2};
+                //int tpbs[] = {64, 128, 256, 512};//, 128, 256};
+                int tpbs[] = {tpb};//, 128, 256};
 
 
                 T** qkv_buf; T** key_cache; T** value_cache; T** context_buf; T** true_res_host; T** res_host;
@@ -1777,6 +1784,8 @@ int main(int argc, char* argv[]) {
     //using DataType = typename T;//typename TypeConverter<T>::Type;
     std::vector<int> precisions = {32};
     std::vector<int> size_per_heads = {64};
+
+    int tpb = atoi(argv[1]);
     
     for (int precision : precisions){
         for (int size_per_head : size_per_heads){
@@ -1800,10 +1809,10 @@ int main(int argc, char* argv[]) {
                 case 32:
                     switch (size_per_head){
                         case 64:
-                            call_precision_headsize<float, 64 >();
+                            call_precision_headsize<float, 64 >(tpb);
                             break;
                         case 128:
-                            call_precision_headsize<float, 128>();
+                            call_precision_headsize<float, 128>(tpb);
                             break;
                         default:
                             printf("Not support head size\n");
