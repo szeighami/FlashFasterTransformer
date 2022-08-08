@@ -15,8 +15,13 @@
 #define tpb128
 #define tpb256
 #define tpb512
+#define tpk1
 #define tpk2
+#define tpk4
+#define tpv1
+#define tpv2
 #define tpv4
+#define tpv8
 
 float half_to_float(uint16_t float16_value)
 {
@@ -1650,15 +1655,13 @@ bool check_res(uint16_t** true_res_host, uint16_t** res_host, int no_layers, int
 
 
 template<typename T, int size_per_head>
-void call_precision_headsize(int tpb){
+void call_precision_headsize(int max_input_len, int max_tokens, int batch_size,int head_num,int no_layers,int tpk,int tpv,int tpb){
     Masked_multihead_attention_params<T> params;
     
     memset(&params, 0, sizeof(params));
     
 
-    int head_num = 32;
     int hidden_units = head_num * size_per_head;
-    int no_layers = 16;
     params.num_heads = head_num;
     params.hidden_size_per_head = size_per_head;
 
@@ -1675,13 +1678,6 @@ void call_precision_headsize(int tpb){
     params.inv_sqrt_dh = 1.F / (sqrtf((float)params.hidden_size_per_head));
     params.relative_attention_bias_stride = 0;
 
-    std::vector<int> batch_sizes = {1};
-    std::vector<int> max_tokenss = {1024};
-    std::vector<int> max_input_lens = {1024};
-    //std::vector<int> batch_sizes = {8};
-    //std::vector<int> max_tokenss = {1024};
-    //std::vector<int> max_input_lens = {1024};
-
 
     bool save_res = false;
     std::string path = "res_settings.csv";
@@ -1697,80 +1693,47 @@ void call_precision_headsize(int tpb){
        }
     }
 
+    params.batch_size = batch_size;
+    params.max_input_len = max_input_len;
+    params.seq_length = max_input_len+max_tokens;
 
+    T** qkv_buf; T** key_cache; T** value_cache; T** context_buf; T** true_res_host; T** res_host;
+    allocate_mem<T>(params, no_layers, &qkv_buf, &key_cache, &value_cache, &context_buf, &true_res_host, &res_host);
+    cudaDeviceSynchronize();
 
-    for (int batch_size : batch_sizes){
-        for (int max_tokens : max_tokenss){
-            for (int max_input_len : max_input_lens){
-                params.batch_size = batch_size;
-                params.max_input_len = max_input_len;
-                params.seq_length = max_input_len+max_tokens;
+    int reps=5; int warmup=3;
 
-                /*
-                int tpvs[] = {2, 4, -1};
-                if (sizeof(T) == 2)
-                    tpvs[2] = 8;
-                else
-                    tpvs[2] = 1;
-                int tpks[] = {1, 2, 4};
-                int tpbs[] = {64, 128, 256};
-                */
-
-                
-                //int tpvs[] = {2, 4, 8};
-                int tpvs[] = {4};
-                int tpks[] = {2};
-                //int tpbs[] = {64, 128, 256, 512};//, 128, 256};
-                int tpbs[] = {tpb};//, 128, 256};
-
-
-                T** qkv_buf; T** key_cache; T** value_cache; T** context_buf; T** true_res_host; T** res_host;
-                allocate_mem<T>(params, no_layers, &qkv_buf, &key_cache, &value_cache, &context_buf, &true_res_host, &res_host);
-                cudaDeviceSynchronize();
-
-                int reps=5; int warmup=3;
-
-                for (int v = 0; v < sizeof(tpvs)/sizeof(tpvs[0]); v++){
-                    for (int k = 0; k < sizeof(tpks)/sizeof(tpks[0]); k++){
-                        for (int b = 0; b < sizeof(tpbs)/sizeof(tpbs[0]); b++){
-
-                            reset_device_res<T>(params, context_buf, no_layers);
-                            bool success = forward<T, size_per_head, size_per_head, Masked_multihead_attention_params<T>>(params, 0, tpvs[v], tpks[k], tpbs[b], no_layers, qkv_buf, key_cache, value_cache, context_buf, false, res_host);
-                            if (!success){
-                                printf("tpv=%d, tpk=%d,tpb=%d, FAILED!\n", tpvs[v], tpks[k], tpbs[b]);
-                                continue;
-                            }
-
-                            for (int r = 0; r < warmup; r++)
-                                forward<T, size_per_head, size_per_head, Masked_multihead_attention_params<T>>(params, 0, tpvs[v], tpks[k], tpbs[b], no_layers, qkv_buf, key_cache, value_cache, context_buf, false);
-                            cudaDeviceSynchronize();
-
-                            struct timeval start, end;
-                            float secs_used, ms_took;
-                            gettimeofday(&start, NULL);
-
-                            for (int r = 0; r < reps; r++)
-                                forward<T, size_per_head, size_per_head, Masked_multihead_attention_params<T>>(params, 0, tpvs[v], tpks[k], tpbs[b], no_layers, qkv_buf, key_cache, value_cache, context_buf, false);
-                            cudaDeviceSynchronize();
-
-                            gettimeofday(&end, NULL);
-                            secs_used=(end.tv_sec - start.tv_sec); //avoid overflow by subtracting first
-                            ms_took= (((secs_used*1000000.0) + end.tv_usec) - (start.tv_usec))/1000.0;
-                            printf("batch=%d,prompt_len=%d,max_tokens=%d,tpv=%d,tpk=%d,tpb=%d,precision=%lu,size_per_head=%d,time%f\n", batch_size, max_input_len, max_tokens, tpvs[v], tpks[k], tpbs[b], sizeof(T)*8,size_per_head, ms_took/(float)reps);
-
-                            if (save_res){
-                               res_file.open(path, std::ios::app);
-                               res_file << batch_size<<"," << max_input_len<<","<<max_tokens<<","<<tpvs[v]<<","<<tpks[k]<<","<<tpbs[b]<<","<<sizeof(T)*8<<","<<size_per_head<<","<<ms_took/(float)reps<<"\n";
-                               res_file.close();
-                            }
-                        }
-                    }
-                }
-
-                free_mem<T>(no_layers, qkv_buf, key_cache, value_cache, context_buf, true_res_host, res_host);
-            }
-        }
+    reset_device_res<T>(params, context_buf, no_layers);
+    bool success = forward<T, size_per_head, size_per_head, Masked_multihead_attention_params<T>>(params, 0, tpv, tpk, tpb, no_layers, qkv_buf, key_cache, value_cache, context_buf, false, res_host);
+    if (!success){
+        printf("tpv=%d, tpk=%d,tpb=%d, FAILED!\n", tpv, tpk, tpb);
+        return;
     }
+
+    for (int r = 0; r < warmup; r++)
+        forward<T, size_per_head, size_per_head, Masked_multihead_attention_params<T>>(params, 0, tpv, tpk, tpb, no_layers, qkv_buf, key_cache, value_cache, context_buf, false);
+    cudaDeviceSynchronize();
+
+    struct timeval start, end;
+    float secs_used, ms_took;
+    gettimeofday(&start, NULL);
+
+    for (int r = 0; r < reps; r++)
+        forward<T, size_per_head, size_per_head, Masked_multihead_attention_params<T>>(params, 0, tpv, tpk, tpb, no_layers, qkv_buf, key_cache, value_cache, context_buf, false);
+    cudaDeviceSynchronize();
+
+    gettimeofday(&end, NULL);
+    secs_used=(end.tv_sec - start.tv_sec); //avoid overflow by subtracting first
+    ms_took= (((secs_used*1000000.0) + end.tv_usec) - (start.tv_usec))/1000.0;
+    printf("batch=%d,prompt_len=%d,max_tokens=%d,tpv=%d,tpk=%d,tpb=%d,precision=%lu,size_per_head=%d,time%f\n", batch_size, max_input_len, max_tokens, tpv, tpk, tpb, sizeof(T)*8,size_per_head, ms_took/(float)reps);
+
+    if (save_res){
+       res_file.open(path, std::ios::app);
+       res_file << batch_size<<"," << max_input_len<<","<<max_tokens<<","<<tpv<<","<<tpk<<","<<tpb<<","<<sizeof(T)*8<<","<<size_per_head<<","<<ms_took/(float)reps<<"\n";
+       res_file.close();
+    }
+
+    free_mem<T>(no_layers, qkv_buf, key_cache, value_cache, context_buf, true_res_host, res_host);
 
 
 }
@@ -1782,46 +1745,51 @@ int main(int argc, char* argv[]) {
     //using T = typename TypeConverter<float2>::Type;
 
     //using DataType = typename T;//typename TypeConverter<T>::Type;
-    std::vector<int> precisions = {32};
-    std::vector<int> size_per_heads = {64};
 
-    int tpb = atoi(argv[1]);
+
+    int prompt_len = atoi(argv[1]);
+    int max_tokens = atoi(argv[2]);
+    int batch_size = atoi(argv[3]);
+
+    int size_per_head = atoi(argv[4]);
+    int head_num = atoi(argv[5]);
+    int no_layers = atoi(argv[6]);
     
-    for (int precision : precisions){
-        for (int size_per_head : size_per_heads){
-            switch (precision){
-                case 16:
-                    /*
-                    switch (size_per_head){
-                        case 64:
-                            call_precision_headsize<uint16_t, 64>();
-                            break;
-                        case 128:
-                            call_precision_headsize<uint16_t, 128>();
-                            break;
-                        default:
-                            printf("Not support head size\n");
-                            break;
-                            
-                    }
-                    */
+    int precision = atoi(argv[7]);
+
+    int tpk = atoi(argv[8]);
+    int tpv = atoi(argv[9]);
+    int tpb = atoi(argv[10]);
+
+    switch (precision){
+        case 16:
+            switch (size_per_head){
+                case 64:
+                    call_precision_headsize<uint16_t, 64>(prompt_len, max_tokens, batch_size,head_num,no_layers,tpk,tpv,tpb);
                     break;
-                case 32:
-                    switch (size_per_head){
-                        case 64:
-                            call_precision_headsize<float, 64 >(tpb);
-                            break;
-                        case 128:
-                            call_precision_headsize<float, 128>(tpb);
-                            break;
-                        default:
-                            printf("Not support head size\n");
-                            break;
-                            
-                    }
+                case 128:
+                    call_precision_headsize<uint16_t, 128>(prompt_len, max_tokens, batch_size,head_num,no_layers,tpk,tpv,tpb);
+                    break;
+                default:
+                    printf("Not support head size\n");
+                    break;
+                    
+            }
+            break;
+        case 32:
+            switch (size_per_head){
+                case 64:
+                    call_precision_headsize<float, 64 >(prompt_len, max_tokens, batch_size,head_num,no_layers,tpk,tpv,tpb);
+                    break;
+                case 128:
+                    call_precision_headsize<float, 128>(prompt_len, max_tokens, batch_size,head_num,no_layers,tpk,tpv,tpb);
+                    break;
+                default:
+                    printf("Not support head size\n");
+                    break;
+                    
             }
         }
-    }
 
     return 0;
 }
