@@ -18,6 +18,9 @@ target_link_libraries(test_gemm PUBLIC -lcublas -lcudart -lcurand gemm cublasMMW
 add_executable(find_setting find_settings.cu)
 target_link_libraries(find_setting PUBLIC -lcublas -lcudart -lcurand gemm cublasMMWrapper)
 
+add_executable(test_cost_model test_cost_model.cu)
+target_link_libraries(test_cost_model PUBLIC -lcublas -lcudart -lcurand gemm cublasMMWrapper unfused_attention_kernels)
+
 add_executable(test_sampling test_sampling.cu)
 target_link_libraries(test_sampling PUBLIC
                       -lcublas -lcublasLt -lcudart

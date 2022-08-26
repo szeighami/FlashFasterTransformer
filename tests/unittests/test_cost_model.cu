@@ -1,3 +1,14 @@
+//#include "cuda_utils.h"
+//#include "src/fastertransformer/utils/allocator.h"
+//#include "src/fastertransformer/utils/cublasAlgoMap.h"
+#include <cublasLt.h>
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+//#include <map>
+#include <mutex>
+//#include <string>
+#include "src/fastertransformer/kernels/unfused_attention_kernels.h"
+#include "src/fastertransformer/utils/cuda_utils.h"
 #include "src/fastertransformer/layers/attention_layers/DecoderSelfAttentionLayer.h"
 #include "src/fastertransformer/utils/logger.h"
 #include "src/fastertransformer/kernels/decoder_masked_multihead_attention.h"
@@ -22,6 +33,13 @@
 #define tpv2
 #define tpv4
 #define tpv8
+
+cudaStream_t pStream;
+void* qk_out = nullptr;
+void* qk2_out = nullptr;
+void* attn_mask = nullptr;
+cublasStatus_t stat;
+std::mutex mu_;
 
 float half_to_float(uint16_t float16_value)
 {
@@ -75,6 +93,7 @@ float half_to_float(uint16_t float16_value)
 using namespace fastertransformer;
 
 //#define MMHA_USE_FP32_ACUM_FOR_OUT
+
 
 namespace mmha {
 
@@ -1058,7 +1077,7 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
                 // if( ti < params.timestep ) {
                 if (ti < tlength) {
                     if (!skip_mem){
-                        if (params.cache_indir != nullptr){
+                        //if (params.cache_indir != nullptr){
                             const int beam_src =
                                 (params.cache_indir != nullptr) ?
                                     params.cache_indir[(bbi * params.beam_width + beami) * params.seq_length + ti] :
@@ -1067,12 +1086,13 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
                             k[ii] = (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) ?
                                         *reinterpret_cast<const K_vec*>(&k_cache_batch[beam_offset + jj * QK_ELTS_IN_16B]) :
                                         k_vec_zero;
-                        }
+                        /*}
                         else{
                             k[ii] = (Dh == Dh_MAX || jj * QK_ELTS_IN_16B < Dh * params.seq_length) ?
                                         *reinterpret_cast<const K_vec*>(&k_cache_batch[0 + jj * QK_ELTS_IN_16B]) :
                                         k_vec_zero;
                         }
+                        */
                         // add bias and update k_cache
                     }
                     else{
@@ -1240,17 +1260,18 @@ __global__ void masked_multihead_attention_kernel_optimized(Multihead_attention_
                 // Fetch offset based on cache_indir when beam sampling
                 V_vec v;
                 if (!skip_mem){
-                    if (params.cache_indir != nullptr){
+                    //if (params.cache_indir != nullptr){
                         const int beam_src = (params.cache_indir != nullptr) ?
                                                  params.cache_indir[(bbi * params.beam_width + beami) * params.seq_length + ti] :
                                                  0;
                         const int beam_offset = beam_src * params.num_heads * params.seq_length * Dh;
                         // Load the values from the cache.
                         v = *reinterpret_cast<const V_vec*>(&v_cache_batch[beam_offset + ti * Dh]);
-                    }
+                    /*}
                     else{
                         v = *reinterpret_cast<const V_vec*>(&v_cache_batch[0 + ti * Dh]);
                     }
+                    */
                 }
                 else{
                     for (int i = 0; i < V_VEC_SIZE; i++)
@@ -1514,6 +1535,18 @@ inline bool cuda_check_error(std::string message){
 }
 
 template<typename T>
+void init_val_nonrand(T* cu_array, int length, T val)
+{
+    T* array =  (T*)malloc(sizeof(T)*length);
+    for (int j = 0; j < length; j++){
+        array[j] = val;
+    }
+    cudaMemcpy(cu_array, array, sizeof(T) * length, cudaMemcpyHostToDevice);
+    cuda_check_error("nonrand_init");
+    free(array);
+}
+
+template<typename T>
 void init_val(T* cu_array, int length)
 {
     T* array =  (T*)malloc(sizeof(T)*length);
@@ -1566,11 +1599,19 @@ void allocate_mem(const KERNEL_PARAMS_TYPE& params, int no_layers, T*** qkv_buf,
     (*true_res_host) = new T*[no_layers];
     (*res_host) = new T*[no_layers];
 
+    cudaMalloc(&qk_out, sizeof(T) * params.batch_size * params.num_heads * params.seq_length);
+    cudaMalloc(&qk2_out, sizeof(T) * params.batch_size * params.num_heads * params.seq_length);
+    cudaMalloc(&attn_mask, sizeof(T) * params.batch_size * params.num_heads * params.seq_length);
+    init_val_nonrand<T>((T*) attn_mask, params.batch_size * params.num_heads*params.seq_length, 1.0);
+
+
     for (int i = 0; i < no_layers; i++){
         cudaMalloc(&(*qkv_buf)[i], sizeof(T) * params.batch_size * 3 * params.num_heads*params.hidden_size_per_head);
         cudaMalloc(&(*context_buf)[i], sizeof(T)* params.batch_size * params.num_heads * params.hidden_size_per_head);
         cudaMalloc(&(*key_cache)[i], sizeof(T)*params.batch_size*params.num_heads * params.hidden_size_per_head*params.seq_length);
         cudaMalloc(&(*value_cache)[i], sizeof(T)*params.batch_size*params.num_heads * params.hidden_size_per_head*params.seq_length);
+
+        cuda_check_error("malloc");
 
         init_val<T>((*qkv_buf)[i], params.batch_size * 3 * params.num_heads*params.hidden_size_per_head);
         init_val<T>((*context_buf)[i], params.batch_size * params.num_heads * params.hidden_size_per_head);
@@ -1585,6 +1626,165 @@ void allocate_mem(const KERNEL_PARAMS_TYPE& params, int no_layers, T*** qkv_buf,
         }
     }
 }
+
+/*
+static const char *_cudaGetErrorEnum(cublasStatus_t error)
+{
+    switch (error)
+    {
+        case CUBLAS_STATUS_SUCCESS:
+            return "CUBLAS_STATUS_SUCCESS";
+
+        case CUBLAS_STATUS_NOT_INITIALIZED:
+            return "CUBLAS_STATUS_NOT_INITIALIZED";
+
+        case CUBLAS_STATUS_ALLOC_FAILED:
+            return "CUBLAS_STATUS_ALLOC_FAILED";
+
+        case CUBLAS_STATUS_INVALID_VALUE:
+            return "CUBLAS_STATUS_INVALID_VALUE";
+
+        case CUBLAS_STATUS_ARCH_MISMATCH:
+            return "CUBLAS_STATUS_ARCH_MISMATCH";
+
+        case CUBLAS_STATUS_MAPPING_ERROR:
+            return "CUBLAS_STATUS_MAPPING_ERROR";
+
+        case CUBLAS_STATUS_EXECUTION_FAILED:
+            return "CUBLAS_STATUS_EXECUTION_FAILED";
+
+        case CUBLAS_STATUS_INTERNAL_ERROR:
+            return "CUBLAS_STATUS_INTERNAL_ERROR";
+    }
+
+    return "<unknown>";
+}
+*/
+
+template<typename T>
+cublasStatus_t launchCublasGemmStridedBatched(cublasHandle_t handle,
+         cublasOperation_t transa,
+         cublasOperation_t transb,
+         int m, int n, int k,
+         const T *alpha,
+         const T *A, int lda,
+         long long int strideA,
+         const T *B, int ldb,
+         long long int strideB,
+         const T *beta,
+         T *C, int ldc,
+         long long int strideC,
+         int batchCount);
+
+template<>
+cublasStatus_t launchCublasGemmStridedBatched<__half >(cublasHandle_t handle,
+         cublasOperation_t transa,
+         cublasOperation_t transb,
+         int m, int n, int k,
+         const __half *alpha,
+         const __half *A, int lda,
+         long long int strideA,
+         const __half *B, int ldb,
+         long long int strideB,
+         const __half *beta,
+         __half *C, int ldc,
+         long long int strideC,
+         int batchCount){
+
+    return cublasHgemmStridedBatched(handle,
+         transa,
+         transb,
+         m, n, k,
+         alpha,
+         A, lda, strideA,
+         B, ldb, strideB,
+         beta,
+         C, ldc, strideC,
+         batchCount);
+}
+
+template<>
+cublasStatus_t launchCublasGemmStridedBatched<float>(cublasHandle_t handle,
+         cublasOperation_t transa,
+         cublasOperation_t transb,
+         int m, int n, int k,
+         const float *alpha,
+         const float *A, int lda,
+         long long int strideA,
+         const float *B, int ldb,
+         long long int strideB,
+         const float *beta,
+         float *C, int ldc,
+         long long int strideC,
+         int batchCount){
+
+    return cublasSgemmStridedBatched(handle,
+         transa,
+         transb,
+         m, n, k,
+         alpha,
+         A, lda, strideA,
+         B, ldb, strideB,
+         beta,
+         C, ldc, strideC,
+         batchCount);
+}
+
+template<typename T>
+bool forward_defused_gemm(cublasHandle_t handle, int max_input_len, int seq_length, int Dh, int batch_size, int num_heads, int no_layers, T** qkv_buf, T** key_cache, T** value_cache, T** context_buf){
+
+    for (int i = max_input_len; i < seq_length; i++){
+        for (int j = 0; j < no_layers; j++){
+            int batchCount = batch_size * num_heads;
+            const T* q = reinterpret_cast<const T*>(qkv_buf[j]);
+            T* k_cache = reinterpret_cast<T*>(key_cache[j]);
+            T* v_cache = reinterpret_cast<T*>(value_cache[j]);
+            T* out = reinterpret_cast<T*>(context_buf[j]);
+            T* qk = reinterpret_cast<T*>(qk_out);
+            T* qk_2 = reinterpret_cast<T*>(qk2_out);
+
+            T alpha = 1;
+            T beta = 1;
+
+            /*
+            check_cuda_error(launchCublasGemmStridedBatched<T>(handle,
+                                CUBLAS_OP_N,
+                                CUBLAS_OP_N,
+                                1, i, Dh,
+                                &alpha,
+                                q, Dh, Dh,
+                                k_cache, Dh, Dh*seq_length,
+                                &beta,
+                                qk, i, seq_length,
+                                batchCount));
+                                */
+
+            invokeMaskedSoftMax(qk_2, qk, (T*)attn_mask, batch_size, i, num_heads, (T)1.0f, 0);
+            sync_check_cuda_error();
+
+            /*
+            check_cuda_error(launchCublasGemmStridedBatched<T>(handle,
+                                CUBLAS_OP_N,
+                                CUBLAS_OP_T,
+                                1, Dh, i,
+                                &alpha,
+                                qk, i, seq_length,
+                                v_cache, Dh, Dh*seq_length,
+                                &beta,
+                                out, Dh, Dh,
+                                batchCount));
+                                */
+            //sync_check_cuda_error();
+
+       
+
+        }
+    }
+    return true;
+
+}
+
+
 
 
 
@@ -1680,7 +1880,7 @@ void call_precision_headsize(int max_input_len, int max_tokens, int batch_size,i
 
 
     bool save_res = false;
-    std::string path = "res_settings.csv";
+    std::string path = "res_settings_default_kernel.csv";
 
     std::ofstream res_file;
    if (save_res){
@@ -1693,6 +1893,10 @@ void call_precision_headsize(int max_input_len, int max_tokens, int batch_size,i
        }
     }
 
+    cublasHandle_t handle1;
+    cublasHandle_t handle2;
+    cublasHandle_t handle3;
+
     params.batch_size = batch_size;
     params.max_input_len = max_input_len;
     params.seq_length = max_input_len+max_tokens;
@@ -1701,38 +1905,69 @@ void call_precision_headsize(int max_input_len, int max_tokens, int batch_size,i
     allocate_mem<T>(params, no_layers, &qkv_buf, &key_cache, &value_cache, &context_buf, &true_res_host, &res_host);
     cudaDeviceSynchronize();
 
-    int reps=5; int warmup=3;
+
+    int reps=10000; int warmup=4;
 
     reset_device_res<T>(params, context_buf, no_layers);
-    bool success = forward<T, size_per_head, size_per_head, Masked_multihead_attention_params<T>>(params, 0, tpv, tpk, tpb, no_layers, qkv_buf, key_cache, value_cache, context_buf, false, res_host);
+
+    cudaStreamCreate(&pStream);
+    //cublasCreate(&handle1);
+    //cublasSetStream(handle1, pStream);
+
+
+    //bool success = forward<T, size_per_head, size_per_head, Masked_multihead_attention_params<T>>(params, 0, tpv, tpk, tpb, no_layers, qkv_buf, key_cache, value_cache, context_buf, false, res_host);
+    //printf("first try\n");
+    bool success = forward_defused_gemm<T>(handle1, max_input_len, params.seq_length, size_per_head, batch_size, head_num, no_layers, qkv_buf, key_cache, value_cache, context_buf);
     if (!success){
-        printf("tpv=%d, tpk=%d,tpb=%d, FAILED!\n", tpv, tpk, tpb);
+        printf("first try FAILED!\n");
         return;
     }
 
-    for (int r = 0; r < warmup; r++)
-        forward<T, size_per_head, size_per_head, Masked_multihead_attention_params<T>>(params, 0, tpv, tpk, tpb, no_layers, qkv_buf, key_cache, value_cache, context_buf, false);
-    cudaDeviceSynchronize();
+
+    for (int r = 0; r < warmup; r++){
+        //printf("wu %d\n", r);
+        //forward<T, size_per_head, size_per_head, Masked_multihead_attention_params<T>>(params, 0, tpv, tpk, tpb, no_layers, qkv_buf, key_cache, value_cache, context_buf, false);
+        success = forward_defused_gemm<T>(handle1, max_input_len, params.seq_length, size_per_head, batch_size, head_num, no_layers, qkv_buf, key_cache, value_cache, context_buf);
+        if (!success){
+            printf("warm up FAILED!\n");
+            return;
+        }
+    }
+
+    sync_check_cuda_error();
 
     struct timeval start, end;
     float secs_used, ms_took;
     gettimeofday(&start, NULL);
 
-    for (int r = 0; r < reps; r++)
-        forward<T, size_per_head, size_per_head, Masked_multihead_attention_params<T>>(params, 0, tpv, tpk, tpb, no_layers, qkv_buf, key_cache, value_cache, context_buf, false);
+    for (int r = 0; r < reps; r++){
+        //printf("r %d\n", r);
+        //forward<T, size_per_head, size_per_head, Masked_multihead_attention_params<T>>(params, 0, tpv, tpk, tpb, no_layers, qkv_buf, key_cache, value_cache, context_buf, false);
+        success = forward_defused_gemm<T>(handle1, max_input_len, params.seq_length, size_per_head, batch_size, head_num, no_layers, qkv_buf, key_cache, value_cache, context_buf);
+        if (!success){
+            printf("real %d FAILED!\n", r);
+            return;
+        }
+        //sync_check_cuda_error();
+        //cudaStreamSynchronize(pStream);
+    }
     cudaDeviceSynchronize();
 
     gettimeofday(&end, NULL);
     secs_used=(end.tv_sec - start.tv_sec); //avoid overflow by subtracting first
-    ms_took= (((secs_used*1000000.0) + end.tv_usec) - (start.tv_usec))/1000.0;
-    printf("batch=%d,prompt_len=%d,max_tokens=%d,tpv=%d,tpk=%d,tpb=%d,precision=%lu,size_per_head=%d,time%f\n", batch_size, max_input_len, max_tokens, tpv, tpk, tpb, sizeof(T)*8,size_per_head, ms_took/(float)reps);
+    if (reps == 0)
+        ms_took= ((((secs_used*1000000.0) + end.tv_usec) - (start.tv_usec))/1000.0);
+    else
+        ms_took= ((((secs_used*1000000.0) + end.tv_usec) - (start.tv_usec))/1000.0)/(float)reps;
+    printf("batch=%d,prompt_len=%d,max_tokens=%d,tpv=%d,tpk=%d,tpb=%d,precision=%lu,size_per_head=%d,time%f\n", batch_size, max_input_len, max_tokens, tpv, tpk, tpb, sizeof(T)*8,size_per_head, ms_took);
 
     if (save_res){
        res_file.open(path, std::ios::app);
-       res_file << batch_size<<"," << max_input_len<<","<<max_tokens<<","<<tpv<<","<<tpk<<","<<tpb<<","<<sizeof(T)*8<<","<<size_per_head<<","<<ms_took/(float)reps<<"\n";
+       res_file << batch_size<<"," << max_input_len<<","<<max_tokens<<","<<tpv<<","<<tpk<<","<<tpb<<","<<sizeof(T)*8<<","<<size_per_head<<","<<ms_took<<"\n";
        res_file.close();
     }
 
+    //cublasDestroy(handle1);
     free_mem<T>(no_layers, qkv_buf, key_cache, value_cache, context_buf, true_res_host, res_host);
 
 
@@ -1746,6 +1981,7 @@ int main(int argc, char* argv[]) {
 
     //using DataType = typename T;//typename TypeConverter<T>::Type;
 
+    //cublasCreate(&handle);
 
     int prompt_len = atoi(argv[1]);
     int max_tokens = atoi(argv[2]);
@@ -1765,11 +2001,19 @@ int main(int argc, char* argv[]) {
         case 16:
             switch (size_per_head){
                 case 64:
+                    call_precision_headsize<__half, 64>(prompt_len, max_tokens, batch_size,head_num,no_layers,tpk,tpv,tpb);
+                    break;
+                case 128:
+                    call_precision_headsize<__half, 128>(prompt_len, max_tokens, batch_size,head_num,no_layers,tpk,tpv,tpb);
+                    break;
+                    /*
+                case 64:
                     call_precision_headsize<uint16_t, 64>(prompt_len, max_tokens, batch_size,head_num,no_layers,tpk,tpv,tpb);
                     break;
                 case 128:
                     call_precision_headsize<uint16_t, 128>(prompt_len, max_tokens, batch_size,head_num,no_layers,tpk,tpv,tpb);
                     break;
+                    */
                 default:
                     printf("Not support head size\n");
                     break;
