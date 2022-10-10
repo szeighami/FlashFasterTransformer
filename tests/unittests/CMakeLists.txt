@@ -19,7 +19,7 @@ add_executable(find_setting find_settings.cu)
 target_link_libraries(find_setting PUBLIC -lcublas -lcudart -lcurand gemm cublasMMWrapper)
 
 add_executable(test_cost_model test_cost_model.cu)
-target_link_libraries(test_cost_model PUBLIC -lcublas -lcudart -lcurand gemm cublasMMWrapper)
+target_link_libraries(test_cost_model PUBLIC -lcublas -lcudart -lcurand gemm cublasMMWrapper unfused_attention_kernels)
 
 add_executable(run_attention_kernel run_attention_kernel.cu)
 target_link_libraries(run_attention_kernel PUBLIC -lcublas -lcudart -lcurand gemm cublasMMWrapper)
