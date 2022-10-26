@@ -1656,7 +1656,7 @@ bool forward(KERNEL_PARAMS_TYPE params, const cudaStream_t& stream, int no_layer
     for (int i = params.max_input_len; i < params.seq_length; i++){
         int v_vec_size; int k_vec_size; int threads_per_block;
         int precision = sizeof(T) == 4?32:16;
-        get_launch_params(precision, params.batch_size, params.num_heads, params.hidden_size_per_head, i, no_sms, C, gpu_transfer_rate, gpu_clock_rate, mySharedMemAllocationSize, max_sharedmemory_per_block, run_time_smem, v_vec_size, k_vec_size, threads_per_block);
+        get_launch_params(precision, params.batch_size, params.num_heads, params.hidden_size_per_head, i, no_sms, C, gpu_transfer_rate, gpu_clock_rate, mySharedMemAllocationSize, max_sharedmemory_per_block, run_time_smem, threads_per_block, v_vec_size, k_vec_size);
         params.timestep = i;
         for (int j = 0; j < no_layers; j++){
             params.q = reinterpret_cast<const T*>(qkv_buf[j]);
